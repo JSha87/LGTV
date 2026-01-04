@@ -1,13 +1,16 @@
-Folder Structure
-***\LGTV
+# Folder Structure for ***\LGTV
+```
 ├── lgtv.py              (main script)
 ├── MultiMonitorTool.exe (monitor control)
 ├── startup.vbs          (for Group Policy)
 └── shutdown.vbs         (for Group Policy)
+```
 
-C:\ProgramData\LGTVControl\
+# C:\ProgramData\LGTVControl\
+```
 ├── lgtv_store.json      (config + credentials - accessible to USER and SYSTEM)
 └── lgtv.log             (error logs)
+```
 
 Pre-requisites:
 - https://www.python.org/downloads/windows/
