@@ -1,5 +1,5 @@
 """
-LG WebOS TV Unified Controller
+LG WebOS TV Unified Controller - Production Memory-Safe Version
 - Works for both USER and SYSTEM accounts
 - Script in L:\Obsidian\Obsidian Vault\Scripts\LGTV
 - Credentials stored in ProgramData (accessible to both USER and SYSTEM)
@@ -8,6 +8,7 @@ LG WebOS TV Unified Controller
 - Auto pair + plaintext storage
 - Safe connect with enforced timeout
 - Input switching, shutdown, monitor toggles
+- MEMORY SAFE: Proper resource cleanup, bounded retries, explicit limits
 """
 
 import os
@@ -51,12 +52,19 @@ WOL_PORT = 9
 # Connect timeout for WebOSClient.connect()
 CONNECT_TIMEOUT = 5.0  # seconds
 
+# Memory safety limits
+MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB max log file
+MAX_CONNECT_RETRIES = 6
+MAX_INPUT_SWITCH_RETRIES = 2
+MAX_FUTURES_IN_MEMORY = 100  # Limit concurrent futures
+
 # -------------------
 # Logging
 # -------------------
 def log(msg, error=False):
     """
     Log message to console. Only write to file if error=True.
+    Implements log rotation to prevent unbounded growth.
     """
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {msg}"
@@ -69,6 +77,23 @@ def log(msg, error=False):
         try:
             # Ensure storage directory exists
             os.makedirs(STORAGE_DIR, exist_ok=True)
+            
+            # Check log file size and rotate if needed
+            if os.path.exists(LOG_FILE):
+                try:
+                    if os.path.getsize(LOG_FILE) > MAX_LOG_SIZE:
+                        # Rotate log file
+                        backup = LOG_FILE + ".old"
+                        if os.path.exists(backup):
+                            os.remove(backup)
+                        os.rename(LOG_FILE, backup)
+                except (OSError, IOError):
+                    # If rotation fails, truncate the file
+                    try:
+                        with open(LOG_FILE, "w", encoding="utf-8") as f:
+                            f.write(f"[{stamp}] Log rotated due to size\n")
+                    except Exception:
+                        pass
             
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -216,9 +241,13 @@ def load_data():
         return None, None
 
 # -------------------
-# Fast parallel scan
+# Fast parallel scan with memory safety
 # -------------------
 def probe(ip):
+    """
+    Probe a single IP for WebOS TV.
+    MEMORY SAFE: Explicit socket cleanup in finally block.
+    """
     s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -228,31 +257,63 @@ def probe(ip):
     except Exception:
         return None
     finally:
-        try:
-            if s:
+        if s is not None:
+            try:
                 s.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 def scan():
+    """
+    MEMORY SAFE: Bounded executor, explicit cleanup, early exit.
+    """
     log("Fast scanning for WebOS TV...")
     ips = [f"{SUBNET}.{i}" for i in range(1, 255)]
     found = None
     start = time.time()
+    executor = None
+    
     try:
-        with ThreadPoolExecutor(max_workers=THREADS) as ex:
-            futures = {ex.submit(probe, ip): ip for ip in ips}
-            for future in as_completed(futures, timeout=MAX_SCAN_TIME):
-                result = future.result()
-                if result:
-                    found = result
-                    break
-                # small early exit if time exceeded
+        executor = ThreadPoolExecutor(max_workers=THREADS)
+        futures = {}
+        
+        # Submit jobs in batches to limit memory
+        for i in range(0, len(ips), MAX_FUTURES_IN_MEMORY):
+            batch = ips[i:i + MAX_FUTURES_IN_MEMORY]
+            batch_futures = {executor.submit(probe, ip): ip for ip in batch}
+            futures.update(batch_futures)
+            
+            # Process this batch
+            for future in as_completed(batch_futures, timeout=MAX_SCAN_TIME):
+                try:
+                    result = future.result(timeout=1.0)
+                    if result:
+                        found = result
+                        # Cancel remaining futures to free memory
+                        for f in futures:
+                            f.cancel()
+                        return found
+                except Exception:
+                    pass
+                
+                # Early exit if time exceeded
                 if time.time() - start > MAX_SCAN_TIME:
+                    for f in futures:
+                        f.cancel()
                     break
-    except Exception:
-        # as_completed timeout raises; we handle below
-        pass
+            
+            if found or (time.time() - start > MAX_SCAN_TIME):
+                break
+                
+    except Exception as e:
+        log(f"Scan error: {e}", error=True)
+    finally:
+        # Explicit cleanup
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
     if found:
         log(f"TV found at {found}")
@@ -267,6 +328,7 @@ def wol(target_ip=None):
     """
     Send WOL packet. If target_ip provided, send directly to that IP.
     Otherwise broadcast to subnet.
+    MEMORY SAFE: Explicit socket cleanup.
     """
     mac = TV_MAC.replace(":", "").replace("-", "")
     
@@ -298,11 +360,11 @@ def wol(target_ip=None):
     except Exception as e:
         log(f"WOL failed: {e}", error=True)
     finally:
-        try:
-            if s:
+        if s is not None:
+            try:
                 s.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 # -------------------
 # Wait for TV to respond
@@ -311,32 +373,50 @@ def wait_for_tv(ip, max_wait=3, check_interval=1):
     """
     Wait for TV to respond to ping.
     Returns True if TV responds, False if timeout.
+    MEMORY SAFE: Bounded subprocess execution.
     """
     log(f"Waiting for TV at {ip} to respond (max {max_wait}s)...")
     waited = 0
     
     while waited < max_wait:
+        proc = None
         try:
             # Use ping with 1 second timeout
             if sys.platform == "win32":
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     ["ping", "-n", "1", "-w", "500", ip],
-                    capture_output=True,
-                    timeout=1
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
                 )
             else:
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     ["ping", "-c", "1", "-W", "1", ip],
-                    capture_output=True,
-                    timeout=1
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
                 )
             
-            if result.returncode == 0:
-                log(f"TV responded to ping after {waited}s")
-                return True
+            # Wait with timeout
+            try:
+                returncode = proc.wait(timeout=2)
+                if returncode == 0:
+                    log(f"TV responded to ping after {waited}s")
+                    return True
+            except subprocess.TimeoutExpired:
+                # Kill the process if it times out
+                proc.kill()
+                proc.wait()
                 
         except Exception as e:
             log(f"Ping check failed: {e}", error=True)
+        finally:
+            # Ensure process is cleaned up
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                except Exception:
+                    pass
         
         time.sleep(check_interval)
         waited += check_interval
@@ -347,29 +427,12 @@ def wait_for_tv(ip, max_wait=3, check_interval=1):
 # -------------------
 # Monitor utils
 # -------------------
-def get_active_monitors():
-    """Get count of active monitors. Returns 1 if unable to determine."""
-    try:
-        import ctypes
-        return ctypes.windll.user32.GetSystemMetrics(80)
-    except Exception as e:
-        log(f"Failed to query monitor count: {e}")
-        return 1
-
-import subprocess
-import os
-
 def set_monitor(action):
     """
     Enable or disable secondary monitor.
     Uses Windows built-in DisplaySwitch.exe which works across sessions.
+    MEMORY SAFE: Bounded subprocess execution with timeout.
     """
-    # Map actions to DisplaySwitch modes:
-    # /internal = PC screen only (primary monitor)
-    # /external = Second screen only
-    # /extend = Extend displays
-    # /clone = Duplicate displays
-    
     if action == "enable":
         mode = "/extend"
         log("Enabling monitor (extending displays)")
@@ -380,22 +443,39 @@ def set_monitor(action):
         log(f"Unknown monitor action: {action}", error=True)
         return
     
+    proc = None
     try:
-        # DisplaySwitch.exe is built into Windows and works across sessions
-        subprocess.run(
+        proc = subprocess.Popen(
             ["DisplaySwitch.exe", mode],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=6
+            stderr=subprocess.DEVNULL
         )
-        log(f"Monitor mode set to {mode}")
+        
+        # Wait with timeout
+        try:
+            proc.wait(timeout=6)
+            log(f"Monitor mode set to {mode}")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            log(f"DisplaySwitch timed out but command sent", error=True)
+            
     except Exception as e:
         log(f"DisplaySwitch failed: {e}", error=True)
+    finally:
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            except Exception:
+                pass
 
 def get_active_monitors():
     """
     Get count of active monitors.
     Note: When running as SYSTEM, this may not reflect user's session.
+    MEMORY SAFE: No resource leaks.
     """
     try:
         import ctypes
@@ -408,93 +488,173 @@ def get_active_monitors():
         return 1
 
 # -------------------
+# TV alive check
+# -------------------
+def is_tv_responding(ip, timeout=1.0):
+    """
+    Quick check if TV is responding on port 3001.
+    Returns True if TV responds, False otherwise.
+    MEMORY SAFE: Explicit socket cleanup.
+    """
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        result = s.connect_ex((ip, 3001))
+        return result == 0
+    except Exception:
+        return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+# -------------------
 # TV connection & registration
 # -------------------
 def tv_connect():
-    """Connect to TV and handle registration."""
+    """
+    Connect to TV and handle registration.
+    Checks if TV is responding first, sends WOL if not.
+    MEMORY SAFE: Bounded retries, explicit client cleanup on error.
+    """
     ip, key = load_data()
+    
     if not ip:
         log("No stored IP - sending WOL + scan")
         wol()
         time.sleep(2)
         ip = scan()
+        store_data(ip, key or "")  # Store the discovered IP
+    
+    # Check if TV is responding before attempting connection
+    log(f"Checking if TV at {ip} is responding...")
+    if not is_tv_responding(ip):
+        log("TV not responding - sending WOL packet")
+        wol(target_ip=ip)
+        
+        # Wait for TV to wake up
+        log("Waiting for TV to wake...")
+        max_wake_wait = 10  # seconds
+        wake_start = time.time()
+        
+        while time.time() - wake_start < max_wake_wait:
+            time.sleep(1)
+            if is_tv_responding(ip):
+                log(f"TV responded after {int(time.time() - wake_start)}s")
+                break
+        else:
+            log("WARNING: TV did not respond after WOL - attempting connection anyway", error=True)
+        
+        # Additional delay for webOS services to start
+        time.sleep(2)
+    else:
+        log("TV is responding")
 
     log(f"Connecting to LG TV ({ip})...")
-    client = WebOSClient(ip, secure=True)
-
-    # WebOS TLS wake delay handling - try up to 6 times with 0.5s delay
-    for attempt in range(1, 7):
-        try:
-            client.connect()
-            break
-        except Exception as e:
-            # Check for socket errors that indicate we should recreate the client
-            error_str = str(e)
-            if "10038" in error_str or "10054" in error_str:
-                log(f"Connect attempt {attempt}/6 failed with socket error, recreating client")
-                try:
-                    client.disconnect()
-                except Exception:
-                    pass
-                # Recreate client to get fresh socket
-                client = WebOSClient(ip, secure=True)
-            else:
-                log(f"Connect attempt {attempt}/6 failed: {e}")
-            time.sleep(0.5)
-    else:
-        raise Exception("WebSocket connect failed after wake attempts")
-
-    store = {"client_key": key} if key else {}
+    client = None
+    
     try:
+        client = WebOSClient(ip, secure=True)
+
+        # WebOS TLS wake delay handling - bounded retries
+        for attempt in range(1, MAX_CONNECT_RETRIES + 1):
+            try:
+                client.connect()
+                break
+            except Exception as e:
+                # Check for socket errors that indicate we should recreate the client
+                error_str = str(e)
+                if "10038" in error_str or "10054" in error_str:
+                    log(f"Connect attempt {attempt}/{MAX_CONNECT_RETRIES} failed with socket error, recreating client")
+                    # Clean up old client
+                    try:
+                        client.disconnect()
+                    except Exception:
+                        pass
+                    # Recreate client to get fresh socket
+                    client = WebOSClient(ip, secure=True)
+                else:
+                    log(f"Connect attempt {attempt}/{MAX_CONNECT_RETRIES} failed: {e}")
+                
+                if attempt == MAX_CONNECT_RETRIES:
+                    raise Exception(f"WebSocket connect failed after {MAX_CONNECT_RETRIES} attempts")
+                    
+                time.sleep(0.5)
+
+        store = {"client_key": key} if key else {}
+        
+        # Registration with bounded iteration
+        reg_count = 0
         for _ in client.register(store):
-            pass
+            reg_count += 1
+            if reg_count > 10:  # Prevent infinite registration loop
+                raise Exception("Registration loop exceeded maximum iterations")
 
         if "client_key" in store:
             store_data(ip, store["client_key"])
 
         return client
+        
     except Exception as e:
-        raise Exception(f"Registration failed: {e}")
+        # Clean up client on error
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+        raise Exception(f"Connection/registration failed: {e}")
 
 # -------------------
 # High-level actions
 # -------------------
 def switch(input_id):
-    """Switch TV input."""
-    c = tv_connect()
+    """
+    Switch TV input.
+    MEMORY SAFE: Guaranteed client cleanup via try/finally.
+    """
+    client = None
     try:
-        ApplicationControl(c).launch({"id": input_id})
+        client = tv_connect()
+        ApplicationControl(client).launch({"id": input_id})
         log(f"Switched to input: {input_id}")
     except Exception as e:
         log(f"Failed to switch input: {e}", error=True)
-        try:
-            c.disconnect()
-        except Exception:
-            pass
         raise
     finally:
-        try:
-            c.disconnect()
-        except Exception:
-            pass
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
 
 def do_shutdown():
-    """Shut down the TV."""
-    c = tv_connect()
+    """
+    Shut down the TV.
+    MEMORY SAFE: Guaranteed client cleanup via try/finally.
+    """
+    client = None
     try:
-        SystemControl(c).power_off()
+        client = tv_connect()
+        SystemControl(client).power_off()
         log("Shutdown command sent")
     except Exception as e:
         log(f"Shutdown failed: {e}", error=True)
         raise
     finally:
-        try:
-            c.disconnect()
-        except Exception:
-            pass
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
 
 def do_startup_personal():
-    """Startup sequence: Wake TV, switch to personal input, enable monitor."""
+    """
+    Startup sequence: Wake TV, switch to personal input, enable monitor.
+    MEMORY SAFE: Bounded retries, explicit resource cleanup.
+    """
     log("=" * 60)
     log("Startup: PERSONAL mode")
     log("=" * 60)
@@ -519,19 +679,21 @@ def do_startup_personal():
         time.sleep(2)
     
     log("Attempting to switch input...")
-    try:
-        switch(PERSONAL_INPUT)
-        log("Input switch completed successfully")
-    except Exception as e:
-        log(f"Input switch failed: {e}", error=True)
-        log("Retrying after brief delay...")
-        time.sleep(1)
+    
+    # Bounded retry loop
+    for retry in range(1, MAX_INPUT_SWITCH_RETRIES + 1):
         try:
             switch(PERSONAL_INPUT)
-            log("Input switch succeeded on retry")
-        except Exception as e2:
-            log(f"Retry also failed: {e2}", error=True)
-            raise
+            log("Input switch completed successfully")
+            break
+        except Exception as e:
+            if retry == MAX_INPUT_SWITCH_RETRIES:
+                log(f"Input switch failed after {MAX_INPUT_SWITCH_RETRIES} attempts: {e}", error=True)
+                raise
+            else:
+                log(f"Input switch attempt {retry}/{MAX_INPUT_SWITCH_RETRIES} failed: {e}", error=True)
+                log("Retrying after brief delay...")
+                time.sleep(1)
     
     log("Enabling monitor...")
     set_monitor("enable")
@@ -539,7 +701,10 @@ def do_startup_personal():
     log("=" * 60)
 
 def do_toggle():
-    """Toggle between work and personal modes based on monitor count."""
+    """
+    Toggle between work and personal modes based on monitor count.
+    MEMORY SAFE: All called functions have proper cleanup.
+    """
     monitors = get_active_monitors()
     if monitors > 1:
         log(f"{monitors} monitors detected -> Work mode")
