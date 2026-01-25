@@ -18,6 +18,7 @@ import socket
 import time
 import subprocess
 import traceback
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pywebostv.connection import WebOSClient
@@ -26,7 +27,6 @@ from pywebostv.controls import ApplicationControl, SystemControl
 # -------------------
 # Config
 # -------------------
-MONITOR_TOOL = "MultiMonitorTool.exe"
 
 # Script directory for MultiMonitorTool
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +57,34 @@ MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB max log file
 MAX_CONNECT_RETRIES = 6
 MAX_INPUT_SWITCH_RETRIES = 2
 MAX_FUTURES_IN_MEMORY = 100  # Limit concurrent futures
+WATCHDOG_SEC = 45.0 # Hard exit after 45 seconds no matter what
+
+# -------------------
+# New Safety Mechanisms
+# -------------------
+
+def start_watchdog(seconds):
+    """Force-kills the script if it hangs, preventing RAM accumulation."""
+    def kill_script():
+        log(f"WATCHDOG: Script exceeded {seconds}s limit. Force exiting.", error=True)
+        os._exit(1) # Immediate kernel-level exit
+    
+    t = threading.Timer(seconds, kill_script)
+    t.daemon = True
+    t.start()
+
+def ensure_single_instance():
+    """Prevents multiple copies of the script from running at once."""
+    import msvcrt
+    lock_path = os.path.join(STORAGE_DIR, "script.lock")
+    try:
+        # We must keep this file handle open for the duration of the script
+        global _lock_fp
+        _lock_fp = open(lock_path, 'w')
+        msvcrt.locking(_lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
+    except (IOError, PermissionError):
+        # Silent exit if another instance is already running
+        sys.exit(0)
 
 # -------------------
 # Logging
@@ -726,27 +754,38 @@ cmds = {
 }
 
 if __name__ == "__main__":
+    # 1. Immediate Safety Locks
+    ensure_single_instance()
+    start_watchdog(WATCHDOG_SEC)
+
     try:
         log(f"Running as: {os.environ.get('USERNAME', 'UNKNOWN')}")
-        log(f"Script directory: {SCRIPT_DIR}")
-        log(f"Storage location: {STORAGE_DIR}")
         
-        # Initialize store file if missing
-        if not init_store():
-            sys.exit(1)
-        
-        # Load config from store
-        if not load_config():
-            log("ERROR: Configuration not complete. Please edit store file", error=True)
-            log(f"Store file location: {STORE_FILE}", error=True)
-            sys.exit(1)
+        if not init_store(): sys.exit(1)
+        if not load_config(): sys.exit(1)
         
         if len(sys.argv) < 2:
-            raise ValueError("Missing command. Use one of: startup_personal, toggle, shutdown, scan")
+            raise ValueError("Missing command.")
+            
         cmd = sys.argv[1]
+        
+        # Mapping commands based on your wrappers
+        # startup.vbs uses 'startup_personal' 
+        # toggle_mode.vbs uses 'toggle' 
+        # shutdown.vbs uses 'shutdown' 
+        cmds = {
+            "startup_personal": do_startup_personal,
+            "toggle": do_toggle,
+            "shutdown": do_shutdown,
+            "scan": lambda: log(scan()),
+        }
+
         if cmd not in cmds:
             raise ValueError(f"Invalid command: {cmd}")
+            
         cmds[cmd]()
+        log("Execution finished cleanly.")
+
     except Exception as e:
         log(f"ERROR: {e}\n{traceback.format_exc()}", error=True)
         sys.exit(1)
