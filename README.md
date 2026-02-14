@@ -7,7 +7,7 @@ A high-performance, "memory-safe" automation system for LG WebOS TVs. This versi
 ```text
 C:\...\Scripts\LGTV\  <-- Root Folder
 ├── lgtv_controller.py      (Main Python Logic - NO DEPENDENCIES)
-└── wrapper\                (OLD VBScript Launchers)
+└── wrapper\                (VBScript Launchers)
     ├── startup.vbs         (Calls: startup_personal)
     ├── shutdown.vbs        (Calls: shutdown)
     └── toggle_mode.vbs     (Calls: toggle)
