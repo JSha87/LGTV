@@ -426,6 +426,10 @@ def wol(target_ip=None):
     Otherwise broadcast to subnet.
     MEMORY SAFE: Explicit socket cleanup.
     """
+    if not TV_MAC:
+        log("ERROR: TV_MAC is not set", error=True)
+        return
+
     mac = TV_MAC.replace(":", "").replace("-", "")
 
     if len(mac) != 12:
@@ -619,12 +623,6 @@ def is_tv_responding(ip, timeout=1.0):
 
 
 class SimpleWebSocketClient:
-    """
-    Minimal WebSocket client using only standard library.
-    Supports WSS (secure WebSocket) connection.
-    MEMORY SAFE: Explicit resource cleanup.
-    """
-
     def __init__(self, url):
         self.url = url
         self.socket = None
