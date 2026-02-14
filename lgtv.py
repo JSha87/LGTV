@@ -787,8 +787,12 @@ class WebOSClient:
         if self.ws:
             self.ws.close()
 
-        self.ws = SimpleWebSocketClient(self.url)
-        self.ws.connect()
+        try:
+            self.ws = SimpleWebSocketClient(self.url)
+            self.ws.connect()
+        except Exception as e:
+            self.ws = None
+            raise Exception(f"Failed to connect to WebOS TV: {e}")
 
     def send_command(self, uri, payload=None):
         """Send a command to the TV and wait for response."""
@@ -803,16 +807,29 @@ class WebOSClient:
             msg["payload"] = payload
 
         # Send
-        self.ws.send(json.dumps(msg))
+        if not self.ws:
+            raise Exception("WebSocket not initialized")
+        try:
+            self.ws.send(json.dumps(msg))
+        except Exception as e:
+            raise Exception(f"Failed to send message: {e}")
 
         # Receive response
-        response = self.ws.recv(timeout=10.0)
-        if response:
-            return json.loads(response)
-        return None
+        if not self.ws:
+            raise Exception("WebSocket not initialized")
+        try:
+            response = self.ws.recv(timeout=10.0)
+            if response:
+                return json.loads(response)
+            return None
+        except Exception as e:
+            raise Exception(f"Failed to receive response: {e}")
 
     def register(self, client_key=None):
         """Register with the TV."""
+        if not self.ws or not self.ws.connected:
+            raise Exception("Not connected")
+
         payload = REGISTRATION_PAYLOAD.copy()
         if client_key:
             payload["client-key"] = client_key
@@ -822,7 +839,12 @@ class WebOSClient:
         msg = {"type": "register", "id": str(self.message_id), "payload": payload}
 
         # Send
-        self.ws.send(json.dumps(msg))
+        if not self.ws:
+            raise Exception("WebSocket not initialized")
+        try:
+            self.ws.send(json.dumps(msg))
+        except Exception as e:
+            raise Exception(f"Failed to send registration: {e}")
 
         # Wait for prompt or registration
         max_attempts = 10
