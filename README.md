@@ -77,49 +77,29 @@ This setup ensures the TV starts when the PC boots and shuts down when the PC tu
 
 > **Note:** We use the VBS wrappers because they resolve relative paths automatically, making the folder portable.
 
+## 🛠️ Path Configuration
+
+For easy maintenance, you can create a simple text configuration file named `config.txt` in each wrapper directory with these lines:
+
+```
+PYTHON_PATH=C:\Python314\pythonw.exe
+SCRIPT_PATH=L:\Documents\Scripts\Github\LGTV\lgtv.py
+```
+
+This approach allows you to maintain paths in one location rather than updating each VBScript file separately.
+
+### How to use:
+1. Create a `config.txt` file in each wrapper directory (`startup.vbs`, `shutdown.vbs`, `toggle_mode.vbs`)
+2. Update the paths to match your environment
+3. The VBScript wrappers will automatically read these paths
+
+> **Note:** If no config.txt is found, the scripts will use hardcoded default paths.
+
 ---
 
 ## 🔧 VBScript Wrappers
 
-Update your wrapper files to use `pythonw.exe` for 100% silent execution.
-
-### `startup.vbs`
-
-```vbs
-Set objShell = CreateObject("WScript.Shell")
-Set objFSO = CreateObject("Scripting.FileSystemObject")
-scriptDir = objFSO.GetParentFolderName(WScript.ScriptFullName)
-parentDir = objFSO.GetParentFolderName(scriptDir)
-pythonScript = parentDir & "\lgtv_controller.py"
-' Using pythonw.exe for zero-window startup
-objShell.Run "pythonw """ & pythonScript & """ startup_personal", 0, False
-
-```
-
-### `shutdown.vbs`
-
-```vbs
-Set objShell = CreateObject("WScript.Shell")
-Set objFSO = CreateObject("Scripting.FileSystemObject")
-scriptDir = objFSO.GetParentFolderName(WScript.ScriptFullName)
-parentDir = objFSO.GetParentFolderName(scriptDir)
-pythonScript = parentDir & "\lgtv_controller.py"
-' Using pythonw.exe for zero-window shutdown
-objShell.Run "pythonw """ & pythonScript & """ shutdown", 0, False
-
-```
-
-### `toggle_mode.vbs` (For Desktop Shortcut)
-
-```vbs
-Set objShell = CreateObject("WScript.Shell")
-Set objFSO = CreateObject("Scripting.FileSystemObject")
-scriptDir = objFSO.GetParentFolderName(WScript.ScriptFullName)
-parentDir = objFSO.GetParentFolderName(scriptDir)
-pythonScript = parentDir & "\lgtv_controller.py"
-objShell.Run "pythonw """ & pythonScript & """ toggle", 0, False
-
-```
+Wrapper files use `pythonw.exe` for 100% silent execution.
 
 ---
 

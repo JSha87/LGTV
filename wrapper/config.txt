@@ -1,0 +1,4 @@
+# Use these to override path variables
+
+PYTHON_PATH=
+SCRIPT_PATH=

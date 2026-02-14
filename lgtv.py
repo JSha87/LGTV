@@ -1138,7 +1138,7 @@ if __name__ == "__main__":
 
         # Command mapping
         cmds = {
-            "startup_personal": do_startup_personal,
+            "startup": do_startup_personal,
             "toggle": do_toggle,
             "shutdown": do_shutdown,
             "scan": lambda: log(scan()),
