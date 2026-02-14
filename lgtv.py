@@ -1,17 +1,3 @@
-"""
-LG WebOS TV Unified Controller - Zero Dependency Version
-- Works for both USER and SYSTEM accounts
-- Script in L:\Obsidian\Obsidian Vault\Scripts\LGTV
-- Credentials stored in ProgramData (accessible to both USER and SYSTEM)
-- Parallel fast scan (50 workers, short timeouts)
-- Wake-on-LAN with direct IP send
-- Auto pair + plaintext storage
-- Safe connect with enforced timeout
-- Input switching, shutdown, monitor toggles
-- MEMORY SAFE: Proper resource cleanup, bounded retries, explicit limits
-- ZERO EXTERNAL DEPENDENCIES: Only Python standard library
-"""
-
 import os
 import sys
 import json
@@ -117,17 +103,24 @@ def start_watchdog(seconds):
     t.start()
 
 def ensure_single_instance():
-    """Prevents multiple copies of the script from running at once."""
-    import msvcrt
-    lock_path = os.path.join(STORAGE_DIR, "script.lock")
-    try:
-        # We must keep this file handle open for the duration of the script
-        global _lock_fp
-        _lock_fp = open(lock_path, 'w')
-        msvcrt.locking(_lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
-    except (IOError, PermissionError):
-        # Silent exit if another instance is already running
-        sys.exit(0)
+    """
+    KERNEL-LEVEL LOCK: Prevents multiple copies of the script from running.
+    Works across SYSTEM and USER sessions using the 'Global\' namespace.
+    """
+    import ctypes
+    # The 'Global\' prefix is the secret sauce for SYSTEM vs USER isolation
+    mutex_name = "Global\\LGTV_Unified_Controller_Mutex_Lock"
+    
+    kernel32 = ctypes.windll.kernel32
+    # Create a named mutex
+    handle = kernel32.CreateMutexW(None, False, mutex_name)
+    # Check if it already existed
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        # If we get here, another process (SYSTEM or USER) already has the lock.
+        # We exit immediately before any other logic runs.
+        os._exit(0) 
+    
+    return handle # Reference must be kept alive for the duration of the script
 
 # -------------------
 # Logging
