@@ -58,24 +58,21 @@ Accept the request on the TV screen. The key is now stored permanently.
 
 ---
 
-## 🏛️ Group Policy Configuration (Recommended)
-
-This setup ensures the TV starts when the PC boots and shuts down when the PC turns off.
+## 🏛️ Group Policy Configuration for  SHUTDOWN ONLY
 
 1. Open **Local Group Policy Editor** (`gpedit.msc`).
 2. Go to: **Computer Configuration → Windows Settings → Scripts (Startup/Shutdown)**.
-3. **For Startup:**
-* Double-click **Startup**.
-* Add `...\LGTV\wrapper\startup.vbs`.
 
-
-4. **For Shutdown:**
+3. **For Shutdown:**
 * Double-click **Shutdown**.
 * Add `...\LGTV\wrapper\shutdown.vbs`.
 
+## 🏛️ Group Policy Configuration for  SHUTDOWN ONLY
+1. Open **Task Scheduler** 
+2. Trigger should be user Logon.
+3. **Action `...\LGTV\wrapper\startup.vbs`.
 
-
-> **Note:** We use the VBS wrappers because they resolve relative paths automatically, making the folder portable.
+---
 
 ## 🛠️ Path Configuration
 
