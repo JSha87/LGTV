@@ -539,7 +539,7 @@ def set_monitor(action):
         mode = "/extend"
         log("Enabling monitor (extending displays)")
     elif action == "disable":
-        mode = "/internal"
+        mode = "/external"
         log("Disabling secondary monitor (PC screen only)")
     else:
         log(f"Unknown monitor action: {action}", error=True)
