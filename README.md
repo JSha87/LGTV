@@ -1,38 +1,35 @@
-# LG WebOS TV Unified Controller (Zero-Dependency & Fork-Bomb Proof)
+# LG WebOS TV Unified Controller (Zero-Dependency & Fork‑Bomb Proof)
 
-A high-performance, "memory-safe" automation system for LG WebOS TVs. This version is specifically hardened for Windows Group Policy environments to prevent process stacking (fork-bombing) using **Kernel-Level Mutex Locking**.
+A high‑performance, *memory‑safe* automation system for LG WebOS TVs. This version is specifically hardened for Windows Group Policy environments to prevent process stacking (fork‑bombing) using **Kernel‑Level Mutex Locking**.
 
 ## 📂 Folder Structure
 
 ```text
 C:\...\Scripts\LGTV\  <-- Root Folder
-├── lgtv_controller.py      (Main Python Logic - NO DEPENDENCIES)
-└── wrapper\                (VBScript Launchers)
-    ├── startup.vbs         (Calls: startup_personal)
-    ├── shutdown.vbs        (Calls: shutdown)
-    └── toggle_mode.vbs     (Calls: toggle)
-
+├── lgtv.py               (Main Python Logic – no external deps)
+├── lgtv.ps1              (PowerShell launcher – single‑instance guard)
+└── wrapper\              (Legacy VBScript wrappers – optional)
+    ├── startup.vbs
+    ├── shutdown.vbs
+    └── toggle_mode.vbs
 ```
 
-## 🛡️ "Robustat" Safety Logic
+The PowerShell script `lgtv.ps1` now performs the same startup, shutdown, and toggle functions that the VBScript wrappers previously handled. It includes the robust single‑instance check, watchdog, and configuration loading.
 
-To prevent the common "GPO Fork Bomb" (where Windows triggers multiple instances that choke the CPU), this script utilizes:
+## 🛡️ Robust Safety Logic
 
-* **Kernel Mutex:** Uses a system-wide "Global" flag. If a second instance starts (even under a different user account), it detects the lock and kills itself in milliseconds before any network logic runs.
-* **pythonw.exe:** All wrappers are configured to use the windowless Python executable to ensure zero UI flicker.
-* **Watchdog:** A 45-second hard-kill timer prevents zombie processes.
-
----
+* **Kernel Mutex** – System‑wide `Global\LGTV` flag. If a second instance starts, it exits instantly.
+* **pythonw.exe** – The PowerShell wrapper invokes the Python executable in windowless mode, keeping the UI silent.
+* **Watchdog** – A 45‑second hard‑kill timer prevents zombie processes.
 
 ## 🚀 Setup Steps
 
 ### 1. Initial Configuration
 
-Run the script once to generate the config file:
+Run the Python script once to generate the configuration file:
 
 ```powershell
-python lgtv_controller.py scan
-
+python lgtv.py scan
 ```
 
 Navigate to `C:\ProgramData\LGTVControl\` and edit **`lgtv_store.json`**:
@@ -42,7 +39,6 @@ Navigate to `C:\ProgramData\LGTVControl\` and edit **`lgtv_store.json`**:
   "TV_MAC": "AA:BB:CC:DD:EE:FF",
   "SUBNET": "192.168.1"
 }
-
 ```
 
 ### 2. Pairing
@@ -50,73 +46,72 @@ Navigate to `C:\ProgramData\LGTVControl\` and edit **`lgtv_store.json`**:
 Turn your TV **ON** and run the following to trigger the pairing prompt:
 
 ```powershell
-python lgtv_controller.py startup_personal
-
+python lgtv.py startup_personal
 ```
 
 Accept the request on the TV screen. The key is now stored permanently.
 
----
+### 3. PowerShell Launcher
 
-## 🏛️ Group Policy Configuration for  SHUTDOWN ONLY
+Use `lgtv.ps1` for all automated actions. Example commands:
+
+```powershell
+# Start personal mode (HDMI input 3)
+./lgtv.ps1 -Action StartPersonal
+
+# Shut down the TV
+./lgtv.ps1 -Action Shutdown
+
+# Toggle input mode
+./lgtv.ps1 -Action Toggle
+```
+
+`lgtv.ps1` automatically reads `config.txt` in the wrapper folder to locate the Python interpreter and script. If `config.txt` is missing, it falls back to the hard‑coded defaults.
+
+## 🏛️ Group Policy Configuration (Shutdown Only)
 
 1. Open **Local Group Policy Editor** (`gpedit.msc`).
-2. Go to: **Computer Configuration → Windows Settings → Scripts (Startup/Shutdown)**.
+2. Navigate to **Computer Configuration → Windows Settings → Scripts (Startup/Shutdown)**.
+3. For **Shutdown**, add `...\LGTV\wrapper\shutdown.vbs` (or use the PowerShell script directly via a scheduled task).
 
-3. **For Shutdown:**
-* Double-click **Shutdown**.
-* Add `...\LGTV\wrapper\shutdown.vbs`.
+## 🏛️ Group Policy Configuration (Startup via Task Scheduler)
 
-## 🏛️ Group Policy Configuration for  SHUTDOWN ONLY
-1. Open **Task Scheduler** 
-2. Trigger should be user Logon.
-3. **Action `...\LGTV\wrapper\startup.vbs`.
-
----
+1. Open **Task Scheduler**.
+2. Create a trigger for **User Logon**.
+3. Add action `...\LGTV\wrapper\startup.vbs` (or `...\LGTV\lgtv.ps1` with the `StartPersonal` action).
 
 ## 🛠️ Path Configuration
 
-For easy maintenance, you can create a simple text configuration file named `config.txt` in each wrapper directory with these lines:
+Create a `config.txt` file in the `wrapper` directory with the following lines:
 
 ```
-PYTHON_PATH=C:\Python314\pythonw.exe
+PYTHON_PATH=C:\Python\pythonw.exe
 SCRIPT_PATH=L:\Documents\Scripts\Github\LGTV\lgtv.py
 ```
 
-This approach allows you to maintain paths in one location rather than updating each VBScript file separately.
+This keeps paths centralized and avoids editing multiple wrapper files.
 
-### How to use:
-1. Create a `config.txt` file in each wrapper directory (`startup.vbs`, `shutdown.vbs`, `toggle_mode.vbs`)
-2. Update the paths to match your environment
-3. The VBScript wrappers will automatically read these paths
+## 🔧 PowerShell Wrapper Details
 
-> **Note:** If no config.txt is found, the scripts will use hardcoded default paths.
-
----
-
-## 🔧 VBScript Wrappers
-
-Wrapper files use `pythonw.exe` for 100% silent execution.
-
----
+The `lgtv.ps1` script encapsulates the single‑instance guard, watchdog, configuration handling, and command dispatch. It mirrors the previous VBScript logic but offers clearer logging, better error handling, and native PowerShell conveniences.
 
 ## 📊 Performance & Safety Specs
 
 | Feature | Logic | Benefit |
 | --- | --- | --- |
-| **Fork-Bomb Protection** | Win32 Named Mutex (`Global\`) | Only 1 instance can exist across all users/system. |
-| **Execution Engine** | `pythonw.exe` | No black console windows ever appear. |
-| **Subprocess Safety** | `proc.wait(timeout=X)` | Script never hangs on a stuck `ping` or `DisplaySwitch`. |
-| **Memory Ceiling** | 50 concurrent threads | Rapid network scan without RAM bloat. |
-| **Log Rotation** | Auto-rotate at 10MB | Prevents `C:` drive from filling up with error logs. |
-| **Cleanup** | `os._exit(0)` | Immediate process termination on lock detection. |
-
----
+| **Fork‑Bomb Protection** | Win32 Named Mutex (`Global\LGTV`) | Only one instance can exist system‑wide |
+| **Execution Engine** | `pythonw.exe` via PowerShell | No console windows appear |
+| **Subprocess Safety** | `proc.wait(timeout=X)` | Never hangs on a stuck command |
+| **Memory Ceiling** | 50 concurrent threads | Rapid network scan without RAM bloat |
+| **Log Rotation** | Auto‑rotate at 10 MB | Prevents `C:` drive from filling up |
+| **Cleanup** | `os._exit(0)` | Immediate termination on lock detection |
 
 ## 🐛 Troubleshooting
 
-* **Hundreds of Processes in Task Manager:** This indicates the `ensure_single_instance()` logic isn't running first. Ensure that function is called at the **top** of your script's execution block.
-* **TV Won't Wake:** Verify `TV_MAC` is correct in `lgtv_store.json`. Some TVs require "Mobile TV On" to be enabled in the TV's network settings.
-* **Permission Errors:** The script stores data in `C:\ProgramData\LGTVControl`. If the script fails, ensure the `SYSTEM` account has "Full Control" over that folder.
+* **Hundreds of Processes in Task Manager** – The single‑instance check isn’t running first. Ensure the guard runs before any network logic.
+* **TV Won’t Wake** – Verify `TV_MAC` in `lgtv_store.json`. Some TVs require “Mobile TV On” enabled.
+* **Permission Errors** – The script writes to `C:\ProgramData\LGTVControl`. Ensure the `SYSTEM` account has *Full Control* over that folder.
 
-Would you like me to provide the **final optimized Python code block** for the `ensure_single_instance` function to make sure it matches this "Robustat" standard?
+---
+
+*This README has been updated to reflect the new PowerShell refactor and to remove obsolete VBScript references.*
