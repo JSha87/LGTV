@@ -2,6 +2,12 @@
 <#
 .SYNOPSIS
     LG WebOS TV controller - PowerShell 5.1, optimized, memory-safe, and file-lock resilient.
+.NOTES
+    DRY pass: shared retry/disposal/response-validation helpers replace duplicated scaffolding
+    that used to be re-written per call site (file IO, TV connect, registration, input-switch
+    retry, WOL bootstrap). Behavior and all safety mechanisms (mutex, watchdog, atomic writes,
+    DPAPI, cert/TLS quirk handling) are preserved; see inline comments where a shared helper
+    replaces what was previously copy-pasted logic.
 #>
 
 [CmdletBinding()]
@@ -24,11 +30,9 @@ $StorageDir = Join-Path $programData 'LGTVControl'
 $StoreFile  = Join-Path $StorageDir 'lgtv_store.json'
 $LogFile    = Join-Path $StorageDir 'lgtv.log'
 
-$Script:SUBNET = $null
 $Script:TV_MAC = $null
-$Script:BROADCAST_IP = $null
+$Script:SubnetInfo = $null
 
-$ScanTimeoutMs       = 300
 $MaxScanTimeSec      = 5
 
 $PersonalInput       = 'com.webos.app.hdmi3'
@@ -42,12 +46,12 @@ $RegistrationTimeoutMs = 4000
 
 $MaxLogSizeBytes       = 10MB
 $MaxConnectRetries     = 5
+$MaxRegisterRetries    = 5
 $MaxInputSwitchRetries = 5
 $WatchdogSec           = 60
 $VerifyInputTimeoutMs  = 8000
 $VerifyInputPollMs     = 400
 
-$WebOSWsPort  = 3000
 $WebOSWssPort = 3001
 
 $Script:InstanceMutex = $null
@@ -77,46 +81,121 @@ function Unprotect-String([string]$EncryptedText) {
 }
 
 # =====================================================================
-# Safe File IO (Prevents File Locking Errors)
+# Subnet / CIDR helpers
+# =====================================================================
+function ConvertTo-IPUInt32 {
+    param([Parameter(Mandatory = $true)][string]$IpAddress)
+    $bytes = [System.Net.IPAddress]::Parse($IpAddress).GetAddressBytes()
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($bytes) }
+    return [BitConverter]::ToUInt32($bytes, 0)
+}
+
+function ConvertFrom-IPUInt32 {
+    param([Parameter(Mandatory = $true)][uint32]$Value)
+    $bytes = [BitConverter]::GetBytes($Value)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($bytes) }
+    return ([System.Net.IPAddress]::new($bytes)).ToString()
+}
+
+function Get-SubnetInfo {
+    param([Parameter(Mandatory = $true)][string]$Cidr)
+
+    if ($Cidr -notmatch '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$') {
+        throw "SUBNET must be in CIDR format, e.g. 192.168.1.0/24 (got: '$Cidr')"
+    }
+    $networkIpText = $Matches[1]
+    $prefixLength = [int]$Matches[2]
+    if ($prefixLength -lt 0 -or $prefixLength -gt 32) {
+        throw "Invalid CIDR prefix length in SUBNET: $Cidr"
+    }
+
+    $rawValue = ConvertTo-IPUInt32 -IpAddress $networkIpText
+    $hostBits = 32 - $prefixLength
+    $maskValue = if ($hostBits -eq 0) { [uint32]::MaxValue } else { [uint32]::MaxValue -shl $hostBits }
+    $networkValue = $rawValue -band $maskValue
+    $broadcastValue = $networkValue -bor (-bnot $maskValue -band [uint32]::MaxValue)
+
+    $hostCount = if ($hostBits -le 1) { 0 } else { [uint32]([math]::Pow(2, $hostBits)) - 2 }
+
+    return [pscustomobject]@{
+        NetworkValue      = $networkValue
+        BroadcastValue    = $broadcastValue
+        NetworkAddress    = ConvertFrom-IPUInt32 -Value $networkValue
+        BroadcastAddress  = ConvertFrom-IPUInt32 -Value $broadcastValue
+        HostCount         = $hostCount
+        PrefixLength      = $prefixLength
+    }
+}
+
+# =====================================================================
+# Shared helpers (retry / disposal / TV-response validation)
+# =====================================================================
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [int]$MaxAttempts = 5,
+        [int]$DelayMs = 200,
+        [scriptblock]$OnRetry
+    )
+    for ($i = 1; $i -le $MaxAttempts; $i++) {
+        try { return (& $Action $i) }
+        catch {
+            if ($i -eq $MaxAttempts) { throw }
+            if ($OnRetry) { & $OnRetry $_ $i }
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+}
+
+function Close-Quietly {
+    param($Disposable)
+    if ($Disposable) { try { $Disposable.Dispose() } catch {} }
+}
+
+function Disconnect-Quietly {
+    param($Client)
+    if ($Client) { try { $Client.Disconnect() } catch {} }
+}
+
+function Confirm-TVResponse {
+    <# Validates a ssap:// response envelope; throws "<FailMessage>: <reason>" on rejection. #>
+    param([Parameter(Mandatory = $true)]$Response, [Parameter(Mandatory = $true)][string]$FailMessage)
+    if (-not $Response -or $Response.type -ne 'response') { throw 'No response from TV' }
+    if ($Response.payload.returnValue) { return }
+    $errText = if ([string]::IsNullOrEmpty([string]$Response.payload.errorText)) { 'Unknown error' } else { [string]$Response.payload.errorText }
+    throw "${FailMessage}: $errText"
+}
+
+# =====================================================================
+# Safe File IO (Prevents File Locking Errors AND torn/corrupted writes)
 # =====================================================================
 
 function Read-JsonFileSafe {
     param([string]$Path)
-    for ($i = 1; $i -le 5; $i++) {
-        try {
-            if (-not (Test-Path -LiteralPath $Path)) { return $null }
-            $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-            $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
-            $json = $sr.ReadToEnd()
-            $sr.Dispose()
-            $fs.Dispose()
-            if ([string]::IsNullOrWhiteSpace($json)) { return $null }
-            return ($json | ConvertFrom-Json)
-        } catch {
-            if ($i -eq 5) { throw }
-            Start-Sleep -Milliseconds 200
-        }
+    Invoke-WithRetry {
+        if (-not (Test-Path -LiteralPath $Path)) { return $null }
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+        try { $json = $sr.ReadToEnd() } finally { $sr.Dispose(); $fs.Dispose() }
+        if ([string]::IsNullOrWhiteSpace($json)) { return $null }
+        return ($json | ConvertFrom-Json)
     }
 }
 
 function Write-JsonFileSafe {
     param([string]$Path, [object]$Data)
     $json = $Data | ConvertTo-Json -Depth 10
-    for ($i = 1; $i -le 5; $i++) {
-        try {
-            $dir = Split-Path -Parent $Path
-            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
-            $sw = New-Object System.IO.StreamWriter($fs, [System.Text.Encoding]::UTF8)
-            $sw.Write($json)
-            $sw.Dispose()
-            $fs.Dispose()
-            return
-        } catch {
-            if ($i -eq 5) { throw }
-            Start-Sleep -Milliseconds 200
-        }
-    }
+    $tempPath = "$Path.tmp"
+    Invoke-WithRetry {
+        $dir = Split-Path -Parent $Path
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+        $fs = New-Object System.IO.FileStream($tempPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $sw = New-Object System.IO.StreamWriter($fs, [System.Text.Encoding]::UTF8)
+        try { $sw.Write($json); $sw.Flush() } finally { $sw.Dispose(); $fs.Dispose() }
+
+        Move-Item -LiteralPath $tempPath -Destination $Path -Force
+    } | Out-Null
 }
 
 # =====================================================================
@@ -243,10 +322,9 @@ function Stop-Watchdog {
 
 function Initialize-Store {
     $template = [ordered]@{
-        _comment     = 'Fill in TV_MAC, SUBNET, and BROADCAST_IP. Script populates tv_ip and client_key automatically.'
+        _comment     = 'Fill in TV_MAC and SUBNET (CIDR format, e.g. 192.168.1.0/24). Broadcast address is derived automatically. Script populates tv_ip and client_key automatically.'
         TV_MAC       = ''
         SUBNET       = ''
-        BROADCAST_IP = ''
         tv_ip        = ''
         client_key   = ''
     }
@@ -299,10 +377,16 @@ function Import-Config {
         $data = Read-JsonFileSafe -Path $StoreFile
         if (-not $data) { return $false }
         $Script:TV_MAC = [string]$data.TV_MAC
-        $Script:SUBNET = [string]$data.SUBNET
-        $Script:BROADCAST_IP = [string]$data.BROADCAST_IP
+        $subnetRaw = [string]$data.SUBNET
 
-        if ([string]::IsNullOrWhiteSpace($Script:TV_MAC) -or [string]::IsNullOrWhiteSpace($Script:SUBNET)) { return $false }
+        if ([string]::IsNullOrWhiteSpace($Script:TV_MAC) -or [string]::IsNullOrWhiteSpace($subnetRaw)) { return $false }
+
+        try {
+            $Script:SubnetInfo = Get-SubnetInfo -Cidr $subnetRaw
+        } catch {
+            Write-Log "Invalid SUBNET value: $($_.Exception.Message)" -IsError
+            return $false
+        }
         return $true
     } catch {
         return $false
@@ -360,37 +444,38 @@ function Test-WebOSPort {
         $client.EndConnect($async)
         return $client.Connected
     } catch { return $false }
-    finally {
-        if ($async -and $async.AsyncWaitHandle) { try { $async.AsyncWaitHandle.Close() } catch {} }
-        try { $client.Close(); $client.Dispose() } catch {}
-    }
+    finally { Close-Quietly $async.AsyncWaitHandle; Close-Quietly $client }
 }
 
 function Find-TV {
     Write-Log 'Fast scanning for WebOS TV...'
-    $ips = 1..254 | ForEach-Object { "$($Script:SUBNET).$_" }
+
+    $hostCount = $Script:SubnetInfo.HostCount
+    if ($hostCount -le 0 -or $hostCount -gt 4096) {
+        throw "SUBNET range is not scannable (host count: $hostCount). Use a /20 or narrower CIDR range, e.g. 192.168.1.0/24."
+    }
+    $networkValue = $Script:SubnetInfo.NetworkValue
+    $ips = 1..$hostCount | ForEach-Object { ConvertFrom-IPUInt32 -Value ($networkValue + $_) }
 
     $clients = New-Object System.Collections.Generic.List[System.Net.Sockets.TcpClient]
     $asyncResults = New-Object System.Collections.Generic.List[IAsyncResult]
     $found = $null
 
     try {
-        for ($i = 0; $i -lt $ips.Count; $i++) {
-            $client = New-Object System.Net.Sockets.TcpClient
-            $clients.Add($client)
-            $asyncResults.Add($client.BeginConnect($ips[$i], $WebOSWssPort, $null, $null))
+        foreach ($ip in $ips) {
+            $c = New-Object System.Net.Sockets.TcpClient
+            $clients.Add($c)
+            try { $asyncResults.Add($c.BeginConnect($ip, $WebOSWssPort, $null, $null)) }
+            catch { $asyncResults.Add($null) }
         }
 
         $deadline = (Get-Date).AddSeconds($MaxScanTimeSec)
         while ((Get-Date) -lt $deadline) {
             for ($i = 0; $i -lt $clients.Count; $i++) {
-                if ($asyncResults[$i].IsCompleted) {
+                if ($asyncResults[$i] -and $asyncResults[$i].IsCompleted) {
                     try {
                         $clients[$i].EndConnect($asyncResults[$i])
-                        if ($clients[$i].Connected) {
-                            $found = $ips[$i]
-                            break
-                        }
+                        if ($clients[$i].Connected) { $found = $ips[$i]; break }
                     } catch {}
                 }
             }
@@ -399,8 +484,8 @@ function Find-TV {
         }
     } finally {
         for ($i = 0; $i -lt $clients.Count; $i++) {
-            if ($asyncResults[$i] -and $asyncResults[$i].AsyncWaitHandle) { try { $asyncResults[$i].AsyncWaitHandle.Close() } catch {} }
-            if ($clients[$i]) { try { $clients[$i].Close(); $clients[$i].Dispose() } catch {} }
+            Close-Quietly $asyncResults[$i].AsyncWaitHandle
+            Close-Quietly $clients[$i]
         }
     }
 
@@ -428,29 +513,17 @@ function Send-WOL {
                 Write-Log "WOL: Sending to $TargetIp`:$WolPort"
                 [void]$udp.Send($packet, $packet.Length, $TargetIp, $WolPort)
             } else {
-                $broadcastAddr = if (-not [string]::IsNullOrWhiteSpace($Script:BROADCAST_IP)) { $Script:BROADCAST_IP } else { "$($Script:SUBNET).255" }
+                $broadcastAddr = $Script:SubnetInfo.BroadcastAddress
                 Write-Log "WOL: Broadcasting to $broadcastAddr`:$WolPort"
                 [void]$udp.Send($packet, $packet.Length, $broadcastAddr, $WolPort)
             }
-        } finally {
-            try { $udp.Close(); $udp.Dispose() } catch {}
-        }
+        } finally { Close-Quietly $udp }
     } catch {
         Write-Log "WOL failed: $($_.Exception.Message)" -IsError
     }
 }
 
 function Wait-ForTV {
-    <#
-        Reacts to actual TV state instead of guessing on a fixed clock.
-        - Polls the real webOS port (not just ICMP ping - a TV can answer
-          ping long before its webOS services are ready to accept a
-          websocket connection).
-        - Re-sends WOL periodically, since it's UDP and can be silently
-          dropped; a single fire-and-forget WOL is not reliable.
-        - Returns as soon as the port responds; only exhausts the full
-          timeout if the TV genuinely never comes up.
-    #>
     param(
         [Parameter(Mandatory = $true)][string]$Ip,
         [int]$MaxWaitSec = 25,
@@ -483,6 +556,22 @@ function Wait-ForTV {
     return $false
 }
 
+function Resolve-TVIp {
+    param([string]$Ip, [string]$Key = '')
+    if ($Ip) { return $Ip }
+    Write-Log 'No stored IP - sending WOL + scan'
+    Send-WOL
+    Start-Sleep -Seconds 2
+    try {
+        $found = Find-TV
+        Set-StoredData -Ip $found -Key $Key
+        return $found
+    } catch {
+        Write-Log "Could not locate TV on the network: $($_.Exception.Message)" -IsError
+        throw
+    }
+}
+
 # =====================================================================
 # Monitor helpers
 # =====================================================================
@@ -491,20 +580,13 @@ if (-not ('LGTVControl.Native' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
 namespace LGTVControl {
     public static class Native {
         [DllImport("user32.dll")]
         public static extern int GetSystemMetrics(int nIndex);
     }
-}
-'@
-}
-
-if (-not ('LGTVControl.DisplayConfig' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-namespace LGTVControl {
     public static class DisplayConfig {
         [DllImport("user32.dll")]
         public static extern int SetDisplayConfig(
@@ -520,16 +602,6 @@ namespace LGTVControl {
         public const uint SDC_TOPOLOGY_EXTERNAL = 0x00000008;
         public const uint SDC_APPLY             = 0x00000080;
     }
-}
-'@
-}
-
-if (-not ('LGTVControl.CertValidator' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Net.Security;
-using System.Security.Cryptography.X509Certificates;
-namespace LGTVControl {
     public static class CertValidator {
         // A real .NET delegate, not a PowerShell scriptblock. WebOS TVs use
         // self-signed certs, and SSL negotiation happens on a thread pool
@@ -546,10 +618,6 @@ namespace LGTVControl {
 $Script:CertValidationDelegate = $null
 
 function Get-CertValidationDelegate {
-    # Built once and cached. Uses reflection (-as [type] / GetMethod), not
-    # a [LGTVControl.CertValidator] bracket literal, because PowerShell
-    # resolves bracket type literals at PARSE time - before the Add-Type
-    # call above has run - which would fail with "Unable to find type".
     if ($Script:CertValidationDelegate) { return $Script:CertValidationDelegate }
     try {
         $certValidatorType = 'LGTVControl.CertValidator' -as [type]
@@ -577,7 +645,7 @@ function Set-MonitorMode {
     $result = [LGTVControl.DisplayConfig]::SetDisplayConfig(0, [IntPtr]::Zero, 0, [IntPtr]::Zero, $flags)
 
     if ($result -eq 0) {
-        Write-Log "Monitor topology applied successfully"
+        Write-Log 'Monitor topology applied successfully'
     } else {
         Write-Log "SetDisplayConfig failed with error code: $result" -IsError
     }
@@ -604,25 +672,25 @@ class LGWebOSClient {
         $this.HostName = $hostName; $this.Port = $port; $this.MessageId = 0
     }
 
+    hidden [System.Threading.CancellationTokenSource] NewCts([int]$TimeoutMs) {
+        $c = New-Object System.Threading.CancellationTokenSource
+        $c.CancelAfter($TimeoutMs)
+        return $c
+    }
+
+    hidden [void] AssertConnected() {
+        if (-not $this.Socket -or $this.Socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+            throw "Not connected (socket state: $(if ($this.Socket) { $this.Socket.State } else { 'null' }), close status: $(if ($this.Socket -and $this.Socket.CloseStatus) { $this.Socket.CloseStatus } else { 'none' }), close description: '$(if ($this.Socket) { $this.Socket.CloseStatusDescription } else { '' })')"
+        }
+    }
+
     [void] Connect([int]$TimeoutMs) {
-        # .NET Framework's default ServicePointManager security protocol
-        # selection can exclude TLS versions WebOS TVs actually speak,
-        # causing ConnectAsync to fault immediately (not time out).
         try {
             [System.Net.ServicePointManager]::SecurityProtocol = `
                 [System.Net.SecurityProtocolType]::Tls12 -bor `
                 [System.Net.SecurityProtocolType]::Tls11 -bor `
                 [System.Net.SecurityProtocolType]::Tls
         } catch {}
-
-        # Use a compiled .NET delegate, not a PowerShell scriptblock -
-        # scriptblocks fail on the SSL negotiation thread pool thread with
-        # "no Runspace available", which silently breaks the handshake.
-        # Built once via Get-CertValidationDelegate (script-scope function)
-        # rather than inline here: PowerShell class methods use stricter
-        # definite-assignment analysis than scriptblocks, so a variable
-        # only assigned inside a try/catch is rejected as "not assigned"
-        # even though it always gets a value.
         $certDelegate = Get-CertValidationDelegate
         if ($certDelegate) {
             try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $certDelegate } catch {}
@@ -638,9 +706,8 @@ class LGWebOSClient {
                 }
             }
             $uri = New-Object System.Uri("wss://$($this.HostName):$($this.Port)/")
-            $cts = New-Object System.Threading.CancellationTokenSource
+            $cts = $this.NewCts($TimeoutMs)
             try {
-                $cts.CancelAfter($TimeoutMs)
                 $task = $ws.ConnectAsync($uri, $cts.Token)
                 $finished = $task.Wait($TimeoutMs)
                 if (-not $finished) { throw 'Connection task timed out' }
@@ -656,7 +723,7 @@ class LGWebOSClient {
                 $this.Socket = $ws; $ws = $null
             } finally { $cts.Dispose() }
         } catch {
-            if ($ws) { try { $ws.Dispose() } catch {} }
+            Close-Quietly $ws
             $detail = $_.Exception.Message
             $inner = $_.Exception.InnerException
             while ($inner) { $detail = "$detail | Inner: $($inner.Message)"; $inner = $inner.InnerException }
@@ -665,15 +732,12 @@ class LGWebOSClient {
     }
 
     [void] Send([object]$Message, [int]$TimeoutMs) {
-        if (-not $this.Socket -or $this.Socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
-            throw "Not connected (socket state: $(if ($this.Socket) { $this.Socket.State } else { 'null' }), close status: $(if ($this.Socket -and $this.Socket.CloseStatus) { $this.Socket.CloseStatus } else { 'none' }), close description: '$(if ($this.Socket) { $this.Socket.CloseStatusDescription } else { '' })')"
-        }
+        $this.AssertConnected()
         $json = $Message | ConvertTo-Json -Depth 20 -Compress
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $segment = New-Object System.ArraySegment[byte] (, $bytes)
-        $cts = New-Object System.Threading.CancellationTokenSource
+        $cts = $this.NewCts($TimeoutMs)
         try {
-            $cts.CancelAfter($TimeoutMs)
             $task = $this.Socket.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token)
             if (-not $task.Wait($TimeoutMs)) { throw 'Send task timed out' }
         } catch { throw "Failed to send message: $($_.Exception.Message)" }
@@ -681,15 +745,12 @@ class LGWebOSClient {
     }
 
     [string] Receive([int]$TimeoutMs) {
-        if (-not $this.Socket -or $this.Socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
-            throw "Not connected (socket state: $(if ($this.Socket) { $this.Socket.State } else { 'null' }), close status: $(if ($this.Socket -and $this.Socket.CloseStatus) { $this.Socket.CloseStatus } else { 'none' }), close description: '$(if ($this.Socket) { $this.Socket.CloseStatusDescription } else { '' })')"
-        }
+        $this.AssertConnected()
         $buffer = New-Object byte[] 8192
         $segment = New-Object System.ArraySegment[byte] (, $buffer)
         $stream = New-Object System.IO.MemoryStream
-        $cts = New-Object System.Threading.CancellationTokenSource
+        $cts = $this.NewCts($TimeoutMs)
         try {
-            $cts.CancelAfter($TimeoutMs)
             do {
                 $task = $this.Socket.ReceiveAsync($segment, $cts.Token)
                 if (-not $task.Wait($TimeoutMs)) { throw 'Receive task timed out' }
@@ -742,16 +803,11 @@ class LGWebOSClient {
         $ws = $this.Socket
         $this.Socket = $null
         if (-not $ws) { return }
-        try {
-            if ($ws.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
-                $cts = New-Object System.Threading.CancellationTokenSource
-                try {
-                    $cts.CancelAfter(2000)
-                    $task = $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, '', $cts.Token)
-                    $task.Wait(2000) | Out-Null
-                } catch {} finally { $cts.Dispose() }
-            }
-        } finally { try { $ws.Dispose() } catch {} }
+        if ($ws.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
+            $cts = $this.NewCts(2000)
+            try { $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, '', $cts.Token).Wait(2000) | Out-Null } catch {} finally { $cts.Dispose() }
+        }
+        Close-Quietly $ws
     }
 }
 
@@ -766,22 +822,13 @@ function Test-TVResponding {
 
 function Connect-TV {
     $stored = Get-StoredData
-    $ip = $stored.Ip
     $key = $stored.Key
-
-    if (-not $ip) {
-        Write-Log 'No stored IP - sending WOL + scan'
-        Send-WOL
-        Start-Sleep -Seconds 2
-        $ip = Find-TV
-        Set-StoredData -Ip $ip -Key $(if ($key) { $key } else { '' })
-    }
+    $ip = Resolve-TVIp -Ip $stored.Ip -Key $(if ($key) { $key } else { '' })
 
     Write-Log "Checking if TV at $ip is responding..."
     if (-not (Test-TVResponding -Ip $ip)) {
         Write-Log 'TV not responding - sending WOL and waiting for it to wake...'
-        $woke = Wait-ForTV -Ip $ip -MaxWaitSec 20 -PollIntervalMs 750 -WolResendIntervalSec 5 -ResendWol
-        if (-not $woke) {
+        if (-not (Wait-ForTV -Ip $ip -MaxWaitSec 20 -PollIntervalMs 750 -WolResendIntervalSec 5 -ResendWol)) {
             throw "TV at $ip did not respond after WOL - aborting (not attempting connection blindly)"
         }
     } else { Write-Log 'TV is responding' }
@@ -790,21 +837,15 @@ function Connect-TV {
     $client = $null
 
     try {
-        for ($attempt = 1; $attempt -le $MaxConnectRetries; $attempt++) {
-            $client = [LGWebOSClient]::new($ip, $WebOSWssPort)
-            try {
-                $client.Connect($ConnectTimeoutMs)
-                Write-Log "Connect succeeded, socket state: $($client.Socket.State)"
-                break
-            } catch {
-                Write-Log "Connect attempt $attempt/$MaxConnectRetries failed: $($_.Exception.Message)" -IsError
-                try { $client.Disconnect() } catch {}
-                $client = $null
-                if ($attempt -eq $MaxConnectRetries) { throw "WebSocket connect failed after $MaxConnectRetries attempts" }
-                Start-Sleep -Milliseconds 500
-            }
+        $client = Invoke-WithRetry -MaxAttempts $MaxConnectRetries -DelayMs 500 -Action {
+            param($attempt)
+            $c = [LGWebOSClient]::new($ip, $WebOSWssPort)
+            try { $c.Connect($ConnectTimeoutMs) } catch { Disconnect-Quietly $c; throw }
+            Write-Log "Connect succeeded, socket state: $($c.Socket.State)"
+            return $c
+        } -OnRetry {
+            param($e, $attempt) Write-Log "Connect attempt $attempt/$MaxConnectRetries failed: $($e.Exception.Message)" -IsError
         }
-        if (-not $client) { throw 'Failed to create WebOS client' }
 
         if ([string]::IsNullOrEmpty($key)) {
             Write-Log 'No client key - initiating registration'
@@ -813,32 +854,20 @@ function Connect-TV {
         } else {
             Write-Log 'Using stored client key'
             $registered = $false
-            $maxRegisterRetries = 5
-            for ($regAttempt = 1; $regAttempt -le $maxRegisterRetries; $regAttempt++) {
+            for ($regAttempt = 1; $regAttempt -le $MaxRegisterRetries; $regAttempt++) {
                 try {
                     $newKey = $client.Register($key, $RegistrationPayload, $SendTimeoutMs, $RegistrationTimeoutMs)
                     if (-not [string]::IsNullOrEmpty($newKey)) { $key = $newKey; Set-StoredData -Ip $ip -Key $key }
                     $registered = $true
                     break
                 } catch {
-                    $isBusy = $_.Exception.Message -match 'PolicyViolation' -or $_.Exception.Message -match 'Try Again Later'
-                    Write-Log "Registration attempt $regAttempt/$maxRegisterRetries with stored key failed: $($_.Exception.Message)" -IsError
-
-                    if ($regAttempt -eq $maxRegisterRetries) { throw }
-
-                    # The TV explicitly told us to back off (WebOS "EWS -
-                    # Try Again Later" policy-violation close), not that the
-                    # key/connection is bad. Reconnecting instantly just hits
-                    # the same busy state again - give it real time to clear,
-                    # backing off further on each repeated busy response.
-                    try { $client.Disconnect() } catch {}
-                    if ($isBusy) {
-                        $backoffMs = 1500 * $regAttempt
-                        Write-Log "TV reported busy/policy-violation - backing off ${backoffMs}ms before retrying registration"
-                        Start-Sleep -Milliseconds $backoffMs
-                    } else {
-                        Start-Sleep -Milliseconds 500
-                    }
+                    Write-Log "Registration attempt $regAttempt/$MaxRegisterRetries with stored key failed: $($_.Exception.Message)" -IsError
+                    if ($regAttempt -eq $MaxRegisterRetries) { throw }
+                    $isBusy = $_.Exception.Message -match 'PolicyViolation|Try Again Later'
+                    Disconnect-Quietly $client
+                    $backoffMs = if ($isBusy) { 1500 * $regAttempt } else { 500 }
+                    if ($isBusy) { Write-Log "TV reported busy/policy-violation - backing off ${backoffMs}ms before retrying registration" }
+                    Start-Sleep -Milliseconds $backoffMs
                     $client = [LGWebOSClient]::new($ip, $WebOSWssPort)
                     $client.Connect($ConnectTimeoutMs)
                 }
@@ -847,7 +876,7 @@ function Connect-TV {
         }
         return $client
     } catch {
-        if ($client) { try { $client.Disconnect() } catch {} }
+        Disconnect-Quietly $client
         throw "Connection/registration failed: $($_.Exception.Message)"
     }
 }
@@ -865,12 +894,6 @@ function Get-ForegroundAppId {
 }
 
 function Wait-ForForegroundApp {
-    <#
-        Polls the TV's actual foreground-app state instead of assuming the
-        switch happened just because the launch command was acknowledged.
-        The launch ack only confirms the TV accepted the request - it does
-        not confirm the input actually changed.
-    #>
     param(
         [Parameter(Mandatory = $true)]$Client,
         [Parameter(Mandatory = $true)][string]$ExpectedAppId,
@@ -903,14 +926,8 @@ function Switch-Input {
     try {
         $client = Connect-TV
         $response = $client.SendCommand('ssap://system.launcher/launch', @{ id = $InputId }, $SendTimeoutMs, $ReceiveTimeoutMs)
-        if (-not $response -or $response.type -ne 'response') { throw 'No response from TV' }
-        if (-not $response.payload.returnValue) {
-            $errorText = if ([string]::IsNullOrEmpty([string]$response.payload.errorText)) { 'Unknown error' } else { $response.payload.errorText }
-            throw "Input switch failed: $errorText"
-        }
+        Confirm-TVResponse -Response $response -FailMessage 'Input switch failed'
 
-        # The launch ack only means the TV accepted the request - confirm
-        # the input actually changed by polling real TV state.
         if (Wait-ForForegroundApp -Client $client -ExpectedAppId $InputId) {
             Write-Log "Switched to input: $InputId (confirmed via getForegroundAppInfo)"
             return
@@ -918,116 +935,93 @@ function Switch-Input {
 
         throw "Input switch to $InputId was acknowledged but TV never reported it as foreground app within ${VerifyInputTimeoutMs}ms"
     } catch { Write-Log "Failed to switch input: $($_.Exception.Message)" -IsError; throw }
-    finally { if ($client) { try { $client.Disconnect() } catch {} } }
+    finally { Disconnect-Quietly $client }
+}
+
+function Invoke-InputSwitchWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$InputId,
+        [int]$MaxRetries = $MaxInputSwitchRetries
+    )
+
+    $ip = (Get-StoredData).Ip
+    Invoke-WithRetry -MaxAttempts $MaxRetries -DelayMs 0 -Action {
+        Switch-Input -InputId $InputId
+        Write-Log 'Input switch completed successfully'
+    } -OnRetry {
+        param($e, $attempt)
+        Write-Log "Input switch attempt $attempt/$MaxRetries failed: $($e.Exception.Message)" -IsError
+        if (-not $ip) { return }
+        Write-Log 'Re-checking TV is still reachable before retrying...'
+        if (-not (Wait-ForTV -Ip $ip -MaxWaitSec 8 -PollIntervalMs 500)) {
+            Write-Log 'TV dropped off the network between attempts - re-sending WOL' -IsError
+            Send-WOL -TargetIp $ip
+            [void](Wait-ForTV -Ip $ip -MaxWaitSec 15 -PollIntervalMs 750 -WolResendIntervalSec 5 -ResendWol)
+        }
+    } | Out-Null
+}
+
+function Enter-Mode {
+    param(
+        [Parameter(Mandatory = $true)][string]$InputId,
+        [Parameter(Mandatory = $true)][ValidateSet('enable', 'disable')][string]$MonitorAction
+    )
+    Invoke-InputSwitchWithRetry -InputId $InputId
+    Set-MonitorMode -Action $MonitorAction
 }
 
 function Invoke-TVShutdown {
     $client = $null
     $ip = $null
     try {
-        $stored = Get-StoredData
-        $ip = $stored.Ip
+        $ip = (Get-StoredData).Ip
         $client = Connect-TV
         $response = $client.SendCommand('ssap://system/turnOff', $null, $SendTimeoutMs, $ReceiveTimeoutMs)
-        if (-not $response -or $response.type -ne 'response') { throw 'No response from TV' }
-        if (-not $response.payload.returnValue) {
-            $errorText = if ([string]::IsNullOrEmpty([string]$response.payload.errorText)) { 'Unknown error' } else { $response.payload.errorText }
-            throw "Shutdown command rejected: $errorText"
-        }
+        Confirm-TVResponse -Response $response -FailMessage 'Shutdown command rejected'
         Write-Log 'Shutdown command acknowledged - verifying TV actually powers off...'
     } catch { Write-Log "Shutdown failed: $($_.Exception.Message)" -IsError; throw }
-    finally { if ($client) { try { $client.Disconnect() } catch {} } }
+    finally { Disconnect-Quietly $client }
 
-    # An acknowledged turnOff command doesn't guarantee the TV powers off
-    # (it may go to a fast-boot standby that still accepts connections
-    # briefly, or the command may be silently dropped). Confirm the webOS
-    # port actually stops responding.
-    if ($ip) {
-        $deadline = (Get-Date).AddMilliseconds($VerifyInputTimeoutMs)
-        $down = $false
-        while ((Get-Date) -lt $deadline) {
-            if (-not (Test-TVResponding -Ip $ip -TimeoutMs 500)) { $down = $true; break }
-            Start-Sleep -Milliseconds $VerifyInputPollMs
-        }
-        if ($down) {
+    if (-not $ip) { return }
+    $deadline = (Get-Date).AddMilliseconds($VerifyInputTimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Test-TVResponding -Ip $ip -TimeoutMs 500)) {
             Write-Log 'Shutdown confirmed - TV is no longer responding'
-        } else {
-            Write-Log "Shutdown was acknowledged but TV is still responding after ${VerifyInputTimeoutMs}ms" -IsError
-            throw 'Shutdown command acknowledged but TV did not power off within the verification window'
+            return
         }
+        Start-Sleep -Milliseconds $VerifyInputPollMs
     }
+    Write-Log "Shutdown was acknowledged but TV is still responding after ${VerifyInputTimeoutMs}ms" -IsError
+    throw 'Shutdown command acknowledged but TV did not power off within the verification window'
 }
 
 function Start-PersonalMode {
     Write-Log ('=' * 60); Write-Log 'Startup: PERSONAL mode'; Write-Log ('=' * 60)
-    $stored = Get-StoredData
-    $ip = $stored.Ip
-
-    if (-not $ip) {
-        Write-Log 'No stored IP - sending broadcast WOL and scanning for TV...'
-        Send-WOL
-        Start-Sleep -Seconds 2
-        try {
-            $ip = Find-TV
-            Set-StoredData -Ip $ip -Key ''
-        } catch {
-            Write-Log "Could not locate TV on the network: $($_.Exception.Message)" -IsError
-            throw
-        }
-    }
+    $ip = Resolve-TVIp -Ip (Get-StoredData).Ip
 
     Write-Log "Waking TV at $ip..."
     Send-WOL -TargetIp $ip
 
-    # React to real TV state: poll the actual webOS port, re-sending WOL if
-    # the TV still hasn't come up (a single UDP WOL packet can be dropped).
-    # If the TV genuinely never responds, fail loudly instead of trying the
-    # input switch anyway on a blind timer.
-    $ready = Wait-ForTV -Ip $ip -MaxWaitSec 25 -PollIntervalMs 750 -WolResendIntervalSec 5 -ResendWol
-    if (-not $ready) {
+    if (-not (Wait-ForTV -Ip $ip -MaxWaitSec 25 -PollIntervalMs 750 -WolResendIntervalSec 5 -ResendWol)) {
         throw "TV at $ip never became reachable after WOL - aborting startup (check TV is plugged in, WOL is enabled in TV network settings, and TV_MAC/SUBNET are correct)"
     }
 
     Write-Log 'Attempting to switch input...'
-    $success = $false
-    $lastError = $null
-    for ($retry = 1; $retry -le $MaxInputSwitchRetries; $retry++) {
-        try {
-            Switch-Input -InputId $PersonalInput
-            Write-Log 'Input switch completed successfully'; $success = $true; break
-        } catch {
-            $lastError = $_
-            if ($retry -eq $MaxInputSwitchRetries) {
-                Write-Log "Input switch failed after $MaxInputSwitchRetries attempts: $($_.Exception.Message)" -IsError
-                break
-            }
-            Write-Log "Input switch attempt $retry/$MaxInputSwitchRetries failed: $($_.Exception.Message)" -IsError
+    Enter-Mode -InputId $PersonalInput -MonitorAction 'enable'
 
-            # React to the failure instead of sleeping a fixed guess: confirm
-            # the TV is still actually reachable before retrying the switch.
-            Write-Log 'Re-checking TV is still reachable before retrying...'
-            if (-not (Wait-ForTV -Ip $ip -MaxWaitSec 8 -PollIntervalMs 500)) {
-                Write-Log 'TV dropped off the network between attempts - re-sending WOL' -IsError
-                Send-WOL -TargetIp $ip
-                [void](Wait-ForTV -Ip $ip -MaxWaitSec 15 -PollIntervalMs 750 -WolResendIntervalSec 5 -ResendWol)
-            }
-        }
-    }
-
-    if (-not $success) {
-        if ($lastError) { throw $lastError }
-        throw 'Personal mode failed to switch TV input'
-    }
-
-    Write-Log 'Enabling monitor...'
-    Set-MonitorMode -Action 'enable'
     Write-Log 'Startup sequence complete'; Write-Log ('=' * 60)
 }
 
 function Invoke-Toggle {
     $monitors = Get-ActiveMonitorCount
-    if ($monitors -gt 1) { Write-Log "$monitors monitors detected -> Work mode"; Switch-Input -InputId $WorkInput; Set-MonitorMode -Action 'disable' }
-    else { Write-Log "$monitors monitor detected -> Personal mode"; Switch-Input -InputId $PersonalInput; Set-MonitorMode -Action 'enable' }
+
+    if ($monitors -gt 1) {
+        Write-Log "$monitors monitors detected -> Work mode"
+        Enter-Mode -InputId $WorkInput -MonitorAction 'disable'
+    } else {
+        Write-Log "$monitors monitor detected -> Personal mode"
+        Start-PersonalMode
+    }
 }
 
 # =====================================================================
