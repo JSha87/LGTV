@@ -83,6 +83,11 @@ function Unprotect-String([string]$EncryptedText) {
 # =====================================================================
 # Subnet / CIDR helpers
 # =====================================================================
+# BROADCAST_IP used to be a separate config field the user had to keep in
+# sync with SUBNET by hand. It's derived here instead: SUBNET is expected
+# in CIDR form (e.g. "192.168.1.0/24"), and both the broadcast address and
+# the scannable host range come directly from that single value.
+
 function ConvertTo-IPUInt32 {
     param([Parameter(Mandatory = $true)][string]$IpAddress)
     $bytes = [System.Net.IPAddress]::Parse($IpAddress).GetAddressBytes()
@@ -98,6 +103,11 @@ function ConvertFrom-IPUInt32 {
 }
 
 function Get-SubnetInfo {
+    <#
+        Parses CIDR notation into network address, broadcast address, and
+        the number of scannable host IPs. Throws with a clear message if
+        SUBNET isn't in the expected "a.b.c.d/nn" form.
+    #>
     param([Parameter(Mandatory = $true)][string]$Cidr)
 
     if ($Cidr -notmatch '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$') {
@@ -130,7 +140,23 @@ function Get-SubnetInfo {
 # =====================================================================
 # Shared helpers (retry / disposal / TV-response validation)
 # =====================================================================
+# Consolidated here because the same three shapes of code were being
+# hand-written at every call site throughout the script:
+#   1. "retry this N times, backing off between attempts"
+#   2. "dispose/disconnect this thing and swallow any error"
+#   3. "the TV sent back a response envelope - did it actually succeed?"
+
 function Invoke-WithRetry {
+    <#
+        Runs Action (receiving the 1-based attempt number) up to
+        MaxAttempts times. On failure, OnRetry (receiving the error and
+        the attempt number) runs BEFORE sleeping DelayMs - but only when
+        another attempt will actually follow, never on the final failed
+        attempt. That lets callers put expensive recovery work (reconnects,
+        network waits) in OnRetry without it running right before giving
+        up anyway. On final failure the original exception propagates
+        unchanged (so the caller's own error message/stack is preserved).
+    #>
     param(
         [Parameter(Mandatory = $true)][scriptblock]$Action,
         [int]$MaxAttempts = 5,
@@ -183,6 +209,21 @@ function Read-JsonFileSafe {
 }
 
 function Write-JsonFileSafe {
+    <#
+        Writes to a temp file, then atomically replaces the real file via
+        Move-Item -Force. This means a mid-write interruption (e.g. the
+        watchdog force-killing the process) leaves an orphaned .tmp file
+        instead of corrupting the live store - a reader only ever sees
+        either the fully-old or fully-new content, never a torn write.
+
+        Move-Item -Force (not [System.IO.File]::Replace) - Replace() can
+        throw "The path is not of a legal form" on Windows PowerShell 5.1
+        when the process's current working directory is itself a mapped
+        network drive, even though both paths here are fully-qualified
+        and local. Move-Item -Force still performs an atomic rename on
+        the same NTFS volume and overwrites the destination without that
+        quirk.
+    #>
     param([string]$Path, [object]$Data)
     $json = $Data | ConvertTo-Json -Depth 10
     $tempPath = "$Path.tmp"
@@ -465,6 +506,11 @@ function Find-TV {
         foreach ($ip in $ips) {
             $c = New-Object System.Net.Sockets.TcpClient
             $clients.Add($c)
+            # $asyncResults stays index-aligned with $clients even if
+            # BeginConnect itself throws synchronously (e.g. transient
+            # resource exhaustion) - a $null placeholder keeps both lists
+            # the same length so the polling/cleanup loops below can never
+            # index past the end of either one.
             try { $asyncResults.Add($c.BeginConnect($ip, $WebOSWssPort, $null, $null)) }
             catch { $asyncResults.Add($null) }
         }
@@ -524,6 +570,16 @@ function Send-WOL {
 }
 
 function Wait-ForTV {
+    <#
+        Reacts to actual TV state instead of guessing on a fixed clock.
+        - Polls the real webOS port (not just ICMP ping - a TV can answer
+          ping long before its webOS services are ready to accept a
+          websocket connection).
+        - Re-sends WOL periodically, since it's UDP and can be silently
+          dropped; a single fire-and-forget WOL is not reliable.
+        - Returns as soon as the port responds; only exhausts the full
+          timeout if the TV genuinely never comes up.
+    #>
     param(
         [Parameter(Mandatory = $true)][string]$Ip,
         [int]$MaxWaitSec = 25,
@@ -557,6 +613,13 @@ function Wait-ForTV {
 }
 
 function Resolve-TVIp {
+    <#
+        Returns the given IP if present; otherwise discovers the TV via
+        WOL + scan and persists the result. Shared by Connect-TV (normal
+        connect path) and Start-PersonalMode (explicit wake-up path) so
+        the "no stored IP yet" bootstrap logic exists in exactly one
+        place instead of being copy-pasted between them.
+    #>
     param([string]$Ip, [string]$Key = '')
     if ($Ip) { return $Ip }
     Write-Log 'No stored IP - sending WOL + scan'
@@ -618,6 +681,10 @@ namespace LGTVControl {
 $Script:CertValidationDelegate = $null
 
 function Get-CertValidationDelegate {
+    # Built once and cached. Uses reflection (-as [type] / GetMethod), not
+    # a [LGTVControl.CertValidator] bracket literal, because PowerShell
+    # resolves bracket type literals at PARSE time - before the Add-Type
+    # call above has run - which would fail with "Unable to find type".
     if ($Script:CertValidationDelegate) { return $Script:CertValidationDelegate }
     try {
         $certValidatorType = 'LGTVControl.CertValidator' -as [type]
@@ -630,8 +697,55 @@ function Get-CertValidationDelegate {
     return $Script:CertValidationDelegate
 }
 
+function Get-ActiveMonitorCount {
+    try {
+        $nativeType = 'LGTVControl.Native' -as [type]
+        return $nativeType::GetSystemMetrics(80)
+    } catch { return 1 }
+}
+
+function Wait-ForDisplayTopologyReady {
+    <#
+        SetDisplayConfig error 31 (ERROR_GEN_FAILURE) most commonly means
+        Windows hasn't finished redetecting the HDMI path yet - the TV
+        reporting the new input as foreground (Wait-ForForegroundApp) is
+        not the same event as the Windows display driver re-enumerating
+        that output. Polls GetSystemMetrics(SM_CMONITORS) until it matches
+        what the requested topology implies, instead of guessing a fixed
+        sleep: extend needs 2 monitors, external/internal-only needs 1.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('enable', 'disable')][string]$Action,
+        [int]$MaxWaitMs = 4000,
+        [int]$PollMs = 250
+    )
+    $expected = if ($Action -eq 'enable') { 2 } else { 1 }
+    $deadline = (Get-Date).AddMilliseconds($MaxWaitMs)
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-ActiveMonitorCount) -eq $expected) { return $true }
+        Start-Sleep -Milliseconds $PollMs
+    }
+    Write-Log "Display topology not ready after ${MaxWaitMs}ms (wanted $expected monitor(s), saw $(Get-ActiveMonitorCount)) - proceeding anyway" -IsError
+    return $false
+}
+
 function Set-MonitorMode {
+    <#
+        Uses SetDisplayConfig directly (the same Win32 API DisplaySwitch.exe
+        wraps) instead of shelling out to DisplaySwitch.exe. Calling it
+        as a subprocess proved unreliable in this context - it could exit
+        cleanly while silently failing to change the actual topology.
+        Calling the API in-process avoids that failure mode entirely and
+        surfaces a real Win32 error code if it does fail.
+
+        Waits for Windows to redetect the display before calling
+        SetDisplayConfig, and retries the call itself a couple of times -
+        error 31 is frequently transient (mid-handshake on the HDMI path)
+        rather than a real configuration problem.
+    #>
     param([Parameter(Mandatory = $true)][ValidateSet('enable', 'disable')][string]$Action)
+
+    [void](Wait-ForDisplayTopologyReady -Action $Action)
 
     $topology = if ($Action -eq 'enable') {
         Write-Log 'Enabling monitor (extending displays)'
@@ -640,22 +754,22 @@ function Set-MonitorMode {
         Write-Log 'Disabling secondary monitor (external display only)'
         [LGTVControl.DisplayConfig]::SDC_TOPOLOGY_EXTERNAL
     }
-
     $flags = $topology -bor [LGTVControl.DisplayConfig]::SDC_APPLY
-    $result = [LGTVControl.DisplayConfig]::SetDisplayConfig(0, [IntPtr]::Zero, 0, [IntPtr]::Zero, $flags)
 
-    if ($result -eq 0) {
-        Write-Log 'Monitor topology applied successfully'
-    } else {
-        Write-Log "SetDisplayConfig failed with error code: $result" -IsError
+    $maxAttempts = 3
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $result = [LGTVControl.DisplayConfig]::SetDisplayConfig(0, [IntPtr]::Zero, 0, [IntPtr]::Zero, $flags)
+        if ($result -eq 0) {
+            Write-Log 'Monitor topology applied successfully'
+            return
+        }
+        if ($attempt -eq $maxAttempts) {
+            Write-Log "SetDisplayConfig failed with error code: $result (after $maxAttempts attempts)" -IsError
+            return
+        }
+        Write-Log "SetDisplayConfig failed with error code: $result - retrying ($attempt/$maxAttempts)..." -IsError
+        Start-Sleep -Milliseconds 750
     }
-}
-
-function Get-ActiveMonitorCount {
-    try {
-        $nativeType = 'LGTVControl.Native' -as [type]
-        return $nativeType::GetSystemMetrics(80)
-    } catch { return 1 }
 }
 
 # =====================================================================
@@ -685,12 +799,33 @@ class LGWebOSClient {
     }
 
     [void] Connect([int]$TimeoutMs) {
+        # .NET Framework's default ServicePointManager security protocol
+        # selection can exclude TLS versions WebOS TVs actually speak,
+        # causing ConnectAsync to fault immediately (not time out).
         try {
             [System.Net.ServicePointManager]::SecurityProtocol = `
                 [System.Net.SecurityProtocolType]::Tls12 -bor `
                 [System.Net.SecurityProtocolType]::Tls11 -bor `
                 [System.Net.SecurityProtocolType]::Tls
         } catch {}
+
+        # Use a compiled .NET delegate, not a PowerShell scriptblock -
+        # scriptblocks fail on the SSL negotiation thread pool thread with
+        # "no Runspace available", which silently breaks the handshake.
+        # Built once via Get-CertValidationDelegate (script-scope function)
+        # rather than inline here: PowerShell class methods use stricter
+        # definite-assignment analysis than scriptblocks, so a variable
+        # only assigned inside a try/catch is rejected as "not assigned"
+        # even though it always gets a value.
+        #
+        # Two callback paths are set deliberately, not redundantly: on
+        # Windows PowerShell 5.1 (.NET Framework), ClientWebSocket's
+        # Options.RemoteCertificateValidationCallback is not settable, so
+        # that assignment throws and we fall back to the
+        # ServicePointManager-level callback, which IS honored on 5.1. On
+        # PowerShell 7+ (.NET Core/5+), the Options property works
+        # directly. Setting both covers both hosts without needing to
+        # detect $PSVersionTable at runtime.
         $certDelegate = Get-CertValidationDelegate
         if ($certDelegate) {
             try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $certDelegate } catch {}
@@ -863,6 +998,16 @@ function Connect-TV {
                 } catch {
                     Write-Log "Registration attempt $regAttempt/$MaxRegisterRetries with stored key failed: $($_.Exception.Message)" -IsError
                     if ($regAttempt -eq $MaxRegisterRetries) { throw }
+
+                    # The TV explicitly told us to back off (WebOS "EWS -
+                    # Try Again Later" policy-violation close), not that the
+                    # key/connection is bad. Reconnecting instantly just hits
+                    # the same busy state again - give it real time to
+                    # clear, backing off further on each repeated busy
+                    # response. This mutable-$client reconnect loop is kept
+                    # hand-written (not folded into Invoke-WithRetry) since
+                    # $client must be reassigned and read across attempts,
+                    # which a generic retry-scriptblock can't safely do.
                     $isBusy = $_.Exception.Message -match 'PolicyViolation|Try Again Later'
                     Disconnect-Quietly $client
                     $backoffMs = if ($isBusy) { 1500 * $regAttempt } else { 500 }
@@ -894,6 +1039,12 @@ function Get-ForegroundAppId {
 }
 
 function Wait-ForForegroundApp {
+    <#
+        Polls the TV's actual foreground-app state instead of assuming the
+        switch happened just because the launch command was acknowledged.
+        The launch ack only confirms the TV accepted the request - it does
+        not confirm the input actually changed.
+    #>
     param(
         [Parameter(Mandatory = $true)]$Client,
         [Parameter(Mandatory = $true)][string]$ExpectedAppId,
@@ -928,6 +1079,8 @@ function Switch-Input {
         $response = $client.SendCommand('ssap://system.launcher/launch', @{ id = $InputId }, $SendTimeoutMs, $ReceiveTimeoutMs)
         Confirm-TVResponse -Response $response -FailMessage 'Input switch failed'
 
+        # The launch ack only means the TV accepted the request - confirm
+        # the input actually changed by polling real TV state.
         if (Wait-ForForegroundApp -Client $client -ExpectedAppId $InputId) {
             Write-Log "Switched to input: $InputId (confirmed via getForegroundAppInfo)"
             return
@@ -939,6 +1092,7 @@ function Switch-Input {
 }
 
 function Invoke-InputSwitchWithRetry {
+    <# Shared retry wrapper around Switch-Input, used by both startup and toggle so both paths get identical resilience. #>
     param(
         [Parameter(Mandatory = $true)][string]$InputId,
         [int]$MaxRetries = $MaxInputSwitchRetries
@@ -962,6 +1116,11 @@ function Invoke-InputSwitchWithRetry {
 }
 
 function Enter-Mode {
+    <#
+        Replaces the separate Enter-PersonalMode/Enter-WorkMode functions -
+        both did the exact same two things (switch input, set monitor
+        mode), differing only in which input/action to use.
+    #>
     param(
         [Parameter(Mandatory = $true)][string]$InputId,
         [Parameter(Mandatory = $true)][ValidateSet('enable', 'disable')][string]$MonitorAction
@@ -982,6 +1141,10 @@ function Invoke-TVShutdown {
     } catch { Write-Log "Shutdown failed: $($_.Exception.Message)" -IsError; throw }
     finally { Disconnect-Quietly $client }
 
+    # An acknowledged turnOff command doesn't guarantee the TV powers off
+    # (it may go to a fast-boot standby that still accepts connections
+    # briefly, or the command may be silently dropped). Confirm the webOS
+    # port actually stops responding.
     if (-not $ip) { return }
     $deadline = (Get-Date).AddMilliseconds($VerifyInputTimeoutMs)
     while ((Get-Date) -lt $deadline) {
@@ -1002,6 +1165,10 @@ function Start-PersonalMode {
     Write-Log "Waking TV at $ip..."
     Send-WOL -TargetIp $ip
 
+    # React to real TV state: poll the actual webOS port, re-sending WOL if
+    # the TV still hasn't come up (a single UDP WOL packet can be dropped).
+    # If the TV genuinely never responds, fail loudly instead of trying the
+    # input switch anyway on a blind timer.
     if (-not (Wait-ForTV -Ip $ip -MaxWaitSec 25 -PollIntervalMs 750 -WolResendIntervalSec 5 -ResendWol)) {
         throw "TV at $ip never became reachable after WOL - aborting startup (check TV is plugged in, WOL is enabled in TV network settings, and TV_MAC/SUBNET are correct)"
     }
@@ -1013,6 +1180,12 @@ function Start-PersonalMode {
 }
 
 function Invoke-Toggle {
+    <#
+        Personal-mode branch delegates straight to Start-PersonalMode -
+        the exact same function 'startup' uses. Work-mode has no
+        equivalent full wake-up sequence needed (you're already at the
+        PC when toggling to work), so it's a direct Enter-Mode call.
+    #>
     $monitors = Get-ActiveMonitorCount
 
     if ($monitors -gt 1) {
