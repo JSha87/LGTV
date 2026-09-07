@@ -196,6 +196,35 @@ function Confirm-TVResponse {
 # Safe File IO (Prevents File Locking Errors AND torn/corrupted writes)
 # =====================================================================
 
+function Repair-StorageAcl {
+    <#
+        Grants BUILTIN\Users Modify rights on the given file or directory.
+        Needed because this script can be invoked under different Windows
+        identities (Task Scheduler running as SYSTEM for startup/shutdown,
+        an interactive user for toggle). Whichever identity creates
+        $StorageDir/$StoreFile first "owns" it, and ProgramData's default
+        inheritance only gives other users Read+Execute - so a later run
+        under a different identity can't overwrite the store file, and
+        Write-JsonFileSafe's Move-Item -Force fails with "Cannot create a
+        file when that file already exists" (the delete-before-rename
+        step silently fails for lack of permission). Called on every run
+        so permissions self-heal even if the file gets recreated later.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        $acl = Get-Acl -LiteralPath $Path
+        $isDir = (Get-Item -LiteralPath $Path) -is [System.IO.DirectoryInfo]
+        $inheritFlags = if ($isDir) { 'ContainerInherit,ObjectInherit' } else { 'None' }
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            'BUILTIN\Users', 'Modify', $inheritFlags, 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $Path -AclObject $acl
+    } catch {
+        Write-Log "Failed to repair ACL on ${Path}: $($_.Exception.Message)" -IsError
+    }
+}
+
 function Read-JsonFileSafe {
     param([string]$Path)
     Invoke-WithRetry {
@@ -372,6 +401,7 @@ function Initialize-Store {
 
     try {
         if (-not (Test-Path -LiteralPath $StorageDir)) { New-Item -ItemType Directory -Path $StorageDir -Force | Out-Null }
+        Repair-StorageAcl -Path $StorageDir
     } catch {
         Write-Log "Failed to create storage directory: $($_.Exception.Message)" -IsError
         return $false
@@ -381,6 +411,7 @@ function Initialize-Store {
         Write-Log 'Store file not found - creating template'
         try {
             Write-JsonFileSafe -Path $StoreFile -Data $template
+            Repair-StorageAcl -Path $StoreFile
             Write-Log "Created template store file at: $StoreFile"
             return $false
         } catch {
@@ -388,6 +419,8 @@ function Initialize-Store {
             return $false
         }
     }
+
+    Repair-StorageAcl -Path $StoreFile
 
     try {
         $data = Read-JsonFileSafe -Path $StoreFile
@@ -751,8 +784,8 @@ function Set-MonitorMode {
         Write-Log 'Enabling monitor (extending displays)'
         [LGTVControl.DisplayConfig]::SDC_TOPOLOGY_EXTEND
     } else {
-        Write-Log 'Disabling secondary monitor (external display only)'
-        [LGTVControl.DisplayConfig]::SDC_TOPOLOGY_EXTERNAL
+        Write-Log 'Disabling secondary monitor (internal display only)'
+        [LGTVControl.DisplayConfig]::SDC_TOPOLOGY_INTERNAL
     }
     $flags = $topology -bor [LGTVControl.DisplayConfig]::SDC_APPLY
 
