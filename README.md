@@ -145,7 +145,7 @@ Three design principles are visible in the diagram:
 ## Requirements
 
 - Windows 10 or 11, PowerShell 5.1 or later
-- An LG webOS TV on the same subnet, reachable by MAC (WOL enabled)
+- An LG webOS TV on an accesible subnet, reachable by MAC (WOL enabled)
 - The TV must have "Mobile TV On" or "Wake on LAN" enabled in its network
   settings, otherwise `Personal` and `Work` will fail at the WOL step
 
