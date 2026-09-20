@@ -1,98 +1,90 @@
-# LG WebOS TV Unified Controller – PowerShell Edition  
+# lgtv.ps1
 
-> A zero‑dependency PowerShell wrapper that manages LG WebOS TVs.  
-> All logic lives in `lgtv.ps1`; the script guarantees a single‑instance, watchdog protection, and a clear CLI for the most common TV actions.
+A PowerShell controller for LG webOS TVs that establishes one of three
+absolute machine states — **Personal**, **Work**, or **Off** — by
+synchronising the TV's power, the TV's active HDMI input, and the Windows
+desktop topology.
 
----
-
-## 📂 Project layout
-
-```
-LGTV/
-├── lgtv.ps1          ← PowerShell
-├── wrapper/          ← VBScript wrappers
-    ├── startup_ps.vbs
-    ├── shutdown_ps.vbs
-    └── toggle_mode_ps.vbs
-└── Legacy            ← Legacy Python version
-```
+The script assumes nothing about the previous state. Every invocation reads
+the TV's own answer, sends commands only when the TV disagrees, and
+re-verifies the result before declaring success.
 
 ---
 
-## ⚙️ Core features
+## The three states
 
-| Feature | How it works | Benefit |
-|---------|--------------|---------|
-| **Single‑instance guard** | Win32 named mutex `Global\LGTV` | Prevents fork‑bombing – only one instance can run at a time |
-| **Watchdog** | 45 s hard‑kill timer | Guarantees the script terminates if it hangs |
-| **Configuration** | Reads `wrapper/config.txt` and `lgtv_store.json` | Centralised path & TV settings |
-| **PowerShell‑only CLI** | `-Action` parameter (`StartPersonal`, `Shutdown`, `Toggle`) | Simple command line for common tasks |
-| **WebOS communication** | `LGWebOSClient` class handles TCP socket, JSON messaging, certificate validation, and command registration | Full control of TV functions (input, monitor mode, shutdown, etc.) |
-| **Wake‑on‑LAN** | `Send-WOL` + `Find-TV` | Starts a sleeping TV |
-| **Monitor mode switching** | `Set-MonitorMode`, `Get-ActiveMonitorCount` | Toggle between different HDMI inputs or app modes |
-| **App management** | `Get-ForegroundAppId`, `Wait-ForForegroundApp` | Detect when a specific app is active |
+| State      | TV power | TV input               | Windows topology   |
+|------------|----------|------------------------|--------------------|
+| `Personal` | On       | Personal HDMI          | Extend (2 monitors)|
+| `Work`     | On       | Work HDMI              | Internal only      |
+| `Off`      | Off      | *(unchanged)*          | Internal only      |
 
----
-
-## 📋 Configuration
-
-1. **Run any function once
-   This will create lgtv_store.json
-   
-
-2. **Store TV settings** in `C:\ProgramData\LGTVControl\lgtv_store.json` (or any location the script can write to).  
-   At a minimum it must contain:
-
-   ```json
-   {
-     "TV_MAC": "AA:BB:CC:DD:EE:FF",
-     "SUBNET": "192.168.1.0/24"
-   }
-   ```
-
-   *The script uses the MAC address to send a Wake‑on‑LAN packet and the subnet to locate the TV on the local network.*
+Each state is self-contained. `Off` does not "remember" it followed
+`Personal`; `Work` does not assume the TV is already awake. Every
+invocation re-establishes the end condition from scratch.
 
 ---
 
-## 🚀 Usage
+## How it works
 
-```powershell
-# Start personal mode (e.g. HDMI 3)
-.\lgtv.ps1 -Action StartPersonal
+```mermaid
+flowchart TD
+    Start([lgtv.ps1 STATE]) --> Mutex{Single instance?}
+    Mutex -- no --> Exit0([exit 0])
+    Mutex -- yes --> Watchdog[Start 75s watchdog]
+    Watchdog --> Store[Initialize-Store]
+    Store --> Branch{Which state?}
 
-# Shut down the TV
-.\lgtv.ps1 -Action Shutdown
+    Branch -- Off --> OffA[Start display topology: Internal]
+    OffA --> OffB{TV reachable?}
+    OffB -- no --> OffDone[Already off, success]
+    OffB -- yes --> OffC[Connect-TV]
+    OffC --> OffD[Subscribe power state]
+    OffD --> OffE[ssap://system/turnOff]
+    OffE --> OffF{Power push or socket close?}
+    OffF --> OffDone
+    OffDone --> JoinA[Join display topology]
+    JoinA --> Done
 
-# Toggle between monitor modes
-.\lgtv.ps1 -Action Toggle
-```
+    Branch -- Personal/Work --> Resolve[Resolve-TVOnline]
+    Resolve --> WOL[Send WOL broadcast + unicast]
+    WOL --> Probe{TCP 3001 answers?}
+    Probe -- no, timeout --> Rescan[Find-TV subnet sweep]
+    Rescan --> Probe
+    Probe -- yes --> TopoA{Topology Extend?}
 
-> **`-Action`** accepts one of the following values:  
-> `StartPersonal`, `Shutdown`, `Toggle`.
+    TopoA -- yes --> DispAsync[Start display topology async]
+    TopoA -- no --> SkipDisp[Defer display change]
+    DispAsync --> Connect
+    SkipDisp --> Connect
 
-The script will:
-1. Acquire the single‑instance mutex.  
-2. Start the watchdog.  
-3. Load configuration.  
-4. Resolve the TV IP via WOL and subnet scanning.  
-5. Perform the requested command (connect, send shutdown, toggle input).  
-6. Clean up and exit.
+    Connect[Connect-TV] --> EWS{Daemon says EWS?}
+    EWS -- yes --> Retry[Wait 1s, retry up to 30x]
+    Retry --> EWS
+    EWS -- no --> Ready[WebSocket registered]
+    Ready --> SetInput
 
----
+    subgraph SetInput [Set-TVInput: read, switch, verify]
+        direction TB
+        WaitReady[Subscribe power state] --> Push1{Ready push?}
+        Push1 -- no --> WaitReady
+        Push1 -- yes --> SubFG[Subscribe foreground app]
+        SubFG --> ReadFG[GET current foreground app]
+        ReadFG --> Match{Matches target?}
+        Match -- yes --> Settle
+        Match -- no --> Launch[ssap://launcher/launch]
+        Launch --> AwaitPush{Foreground push arrives?}
+        AwaitPush -- timeout --> ReadFG
+        AwaitPush -- yes --> ReadFG
+        Settle[2s listen-only settle window] --> Held{Input held?}
+        Held -- no, TV changed app --> ReadFG
+        Held -- yes --> Verified[Input verified]
+    end
 
-## 📌 Group Policy / Task Scheduler
-
-| Target | Setup |
-|--------|-------|
-| **Shutdown** | Add `wrapper\shutdown.vbs` to the *Shutdown* scripts, or schedule a task that runs `.\lgtv.ps1 -Action Shutdown`. |
-| **Startup / Logon** | Add `wrapper\startup.vbs` to the *Startup* scripts, or schedule a task that runs `.\lgtv.ps1 -Action StartPersonal`. |
-
----
-
-## 🔧 Debugging & Logging
-
-* `Write-Log` writes to `C:\ProgramData\LGTVControl\lg_log.txt` (rotated at 10 MB).  
-* If many PowerShell processes appear, ensure the single‑instance guard runs first.  
-* If the TV does not respond, verify the MAC address and subnet in `lgtv_store.json`.  
-
----
+    Verified --> TopoB{Topology Internal?}
+    TopoB -- yes --> DispSync[Start display topology]
+    TopoB -- no --> JoinB[Complete display topology]
+    DispSync --> JoinB
+    JoinB --> Check{All pieces confirmed?}
+    Check -- no --> Fail([exit 1])
+    Check -- yes --> Done([exit 0])
