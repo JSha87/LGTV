@@ -102,13 +102,16 @@ $MaxLogSizeBytes = 2MB
 $WolResendMs     = 1000          # WOL is UDP; re-emit while waiting, driven by elapsed probe time
 
 # --- Logging verbosity ---
+# Runtime value. Loaded from the store file (DEBUG_MODE key) immediately
+# after Initialize-Store runs, so the wrapper and the script agree on one
+# flag stored in one place. The literal below is only the fallback used
+# when the store cannot be read (fresh install, corrupted JSON, ACL). Do
+# not use it as the primary switch - edit DEBUG_MODE in lgtv_store.json.
+#
 # $true  = every Write-Log line is persisted to $LogFile.
 # $false = only -IsError lines are persisted. Informational lines still
-#          print to the console, but are not written to disk. This keeps
-#          the on-disk log small and focused on failures during normal
-#          operation, while a single flip to $true turns the file into a
-#          full trace for debugging.
-$DEBUG_MODE = $true
+#          print to the console, but are not written to disk.
+$DEBUG_MODE = $false
 
 $Script:InstanceMutex  = $null
 $Script:MutexHeld      = $false
@@ -542,11 +545,12 @@ function Initialize-Store {
     # accessor works against that in-memory copy; disk is only touched again
     # when a value actually changes.
     $template = [ordered]@{
-        _comment       = 'TV_MAC and SUBNET are required. SUBNET is CIDR, e.g. 192.168.1.0/24. tv_ip and client_key are managed automatically.'
+        _comment       = 'TV_MAC and SUBNET are required. SUBNET is CIDR, e.g. 192.168.1.0/24. tv_ip and client_key are managed automatically. DEBUG_MODE controls whether the wrapper and this script persist informational log lines.'
         TV_MAC         = ''
         SUBNET         = ''
         PERSONAL_INPUT = $DefaultPersonalInput
         WORK_INPUT     = $DefaultWorkInput
+        DEBUG_MODE     = $false
         tv_ip          = ''
         client_key     = ''
     }
@@ -1613,8 +1617,17 @@ Start-Watchdog -Seconds $WatchdogSec
 $exitCode = 0
 $runTimer = [System.Diagnostics.Stopwatch]::StartNew()
 try {
-    Write-Log ("State request '{0}' by {1} (DEBUG_MODE={2})" -f $State, $env:USERNAME, $DEBUG_MODE)
     Initialize-Store
+
+    # The store is authoritative for DEBUG_MODE. The literal at the top of
+    # this script is only the fallback for the case where the store could
+    # not be read; from here on, whatever the store says wins.
+    $storedDebug = $Script:Store['DEBUG_MODE']
+    if ($null -ne $storedDebug) {
+        $DEBUG_MODE = [bool]$storedDebug
+    }
+
+    Write-Log ("State request '{0}' by {1} (DEBUG_MODE={2})" -f $State, $env:USERNAME, $DEBUG_MODE)
 
     switch ($State) {
         'Personal' { Enter-PersonalState }
