@@ -11,6 +11,26 @@ re-verifies the result before declaring success.
 
 ---
 
+## Repository layout
+
+```
+LGTV/
+    lgtv.ps1                 ← the controller
+    wrapper/
+        Personal.vbs         ← byte-identical copies
+        Work.vbs
+        Off.vbs
+    README.md
+```
+
+The three `.vbs` files are identical byte for byte. Each reads its own
+filename to determine which state to request, then launches `lgtv.ps1`
+hidden and propagates its exit code. The state name is never written into
+the file, so editing one and copying it over the other two is always
+safe — there is nothing to keep in sync except the copy operation itself.
+
+---
+
 ## The three states
 
 | State      | TV power | TV input      | Windows topology    |
@@ -35,7 +55,13 @@ Windows cannot hotplug-override the internal-only topology.
 
 ```mermaid
 flowchart TD
-    Start([lgtv.ps1 STATE]) --> Mutex{Single instance?}
+    Click([Double-click Personal.vbs]) --> Wrapper[wrapper/PERSONAL.vbs]
+    Wrapper --> WrapperState[State = filename]
+    WrapperState --> WrapperDebug[Read DEBUG_MODE from store]
+    WrapperDebug --> WrapperLaunch[wscript.exe Run hidden, wait]
+    WrapperLaunch --> Start[lgtv.ps1 STATE]
+
+    Start --> Mutex{Single instance?}
     Mutex -- no --> Exit0([exit 0])
     Mutex -- yes --> Watchdog[Start watchdog]
     Watchdog --> Store[Initialize-Store]
@@ -94,10 +120,17 @@ flowchart TD
     JoinB --> Check{All pieces confirmed?}
     Check -- no --> Fail([exit 1])
     Check -- yes --> Done([exit 0])
+
+    Done --> WrapperExit[Wrapper propagates exit code]
+    Fail --> WrapperExit
 ```
 
-Two design principles are visible in the diagram:
+Three design principles are visible in the diagram:
 
+- **The wrapper exists for exactly two things.** Suppressing the console
+  flash that `powershell.exe -WindowStyle Hidden` does not suppress on its
+  own, and propagating the exit code back to whatever launched it. It has
+  no other role. All state logic lives in `lgtv.ps1`.
 - **Nothing is polled for its own sake.** Every wait — for the TV to come
   up, for the power state to change, for the foreground app to switch, for
   the display topology to reproject — is waiting on a signal the OS or the
@@ -131,6 +164,10 @@ On the TV: **Settings → General → Mobile TV On → Turn on via Wi-Fi** (or
 .\lgtv.ps1 Personal
 ```
 
+Or double-click `wrapper\Personal.vbs`. Either works; the direct script
+invocation shows the console output live, which is what you want on the
+first run.
+
 The script creates `C:\ProgramData\LGTVControl\lgtv_store.json` on first
 invocation and exits with an error telling you to populate two fields. It
 will not overwrite the file on subsequent runs — editing `TV_MAC` or
@@ -147,13 +184,14 @@ Open `C:\ProgramData\LGTVControl\lgtv_store.json`:
   "SUBNET": "192.168.1.0/24",
   "PERSONAL_INPUT": "com.webos.app.hdmi3",
   "WORK_INPUT": "com.webos.app.hdmi4",
+  "DEBUG_MODE": false,
   "tv_ip": "",
   "client_key": ""
 }
 ```
 
 Only `TV_MAC` and `SUBNET` are required. Everything else is filled in
-automatically:
+automatically or has a safe default:
 
 - `tv_ip` is discovered by a subnet sweep on first use, then reused. If
   the TV moves to a new DHCP lease, delete it to force a re-scan.
@@ -165,6 +203,8 @@ automatically:
   them if your TV's HDMI ports are numbered differently. The values are
   webOS app IDs, not port numbers — inspect the TV with an existing remote
   app if you need to determine the values.
+- `DEBUG_MODE` is the single switch that controls logging verbosity for
+  both `lgtv.ps1` and the wrapper. See the Logging section below.
 
 ### 4. Verify
 
@@ -179,26 +219,60 @@ The first `Personal` or `Work` after a cold boot will take 15–30 seconds
 while the TV's websocket daemon starts. Subsequent invocations complete in
 1–3 seconds.
 
+Then double-click each of `wrapper\Personal.vbs`, `wrapper\Work.vbs`, and
+`wrapper\Off.vbs` to confirm the wrapper path works end to end. The first
+two should switch the TV input and the Windows topology; the third should
+power the TV off.
+
+### 5. Create shortcuts (optional)
+
+If you want desktop icons, hotkey targets, or Stream Deck buttons, create
+shortcuts pointing at the `.vbs` files. Shortcut Target:
+
+```
+%SystemRoot%\System32\wscript.exe "<full path>\wrapper\Personal.vbs"
+```
+
+Note: you cannot rely on the shortcut's *own* name to carry the state —
+`.lnk` files do not expose their name to the process they launch, only
+their Arguments field. That is why the state lives in the wrapper's
+filename, not in a shortcut's name. Three shortcuts, three targets, three
+`.vbs` files.
+
 ---
 
 ## Logging
 
-Two files live in `C:\ProgramData\LGTVControl\`:
+Three files live in `C:\ProgramData\LGTVControl\`:
 
-- **`lgtv.log`** — the run log. By default only `-IsError` lines are
-  persisted, so a successful run leaves no trace. Set `$DEBUG_MODE = $true`
-  near the top of the script to persist every line. Rotates to
-  `lgtv.log.old` at 2 MB.
+- **`lgtv.log`** — the main run log, written by `lgtv.ps1`.
+- **`wrapper.log`** — the wrapper's own log. Written only by the wrapper,
+  only for its own startup failures and the child's exit code.
 - **`lgtv_store.json`** — configuration and cached credentials.
 
-Console output is always fully verbose regardless of `$DEBUG_MODE`; the
-flag controls only what reaches disk.
+### `DEBUG_MODE`
 
-If an editor has opened and saved `lgtv.log`, its ACL may be broken. The
-script repairs this automatically: directory permissions are re-applied at
-startup, and the log write path uses a temp-file-then-rename pattern that
-sidesteps a broken file DACL entirely by creating a fresh file in the
-directory the script owns.
+A single boolean in `lgtv_store.json`, read at startup by **both**
+`lgtv.ps1` and the wrapper, so the two processes always agree on the
+logging verbosity:
+
+- **`false`** (default) — only failure lines are persisted. Successful
+  runs leave no trace on disk. The wrapper logs nothing unless the child
+  process failed. This is what you want for day-to-day use.
+- **`true`** — every line is persisted. Full trace of both processes for
+  debugging.
+
+Console output is always fully verbose regardless of `DEBUG_MODE`; the
+flag controls only what reaches disk. Flip it in `lgtv_store.json` and the
+change takes effect on the next run of either process.
+
+Both logs rotate to `<name>.old` at 2 MB.
+
+If an editor has opened and saved either log, its ACL may be broken. Both
+`lgtv.ps1` and the wrapper repair this automatically: directory
+permissions are re-applied at startup, and every write uses a
+read-then-overwrite pattern that replaces the file's content without
+needing write permission on the pre-existing file's DACL.
 
 ---
 
@@ -208,31 +282,57 @@ Constants near the top of `lgtv.ps1`:
 
 | Variable               | Default | Meaning                                                                        |
 |------------------------|---------|--------------------------------------------------------------------------------|
-| `$DEBUG_MODE`          | `$false`| Persist every log line to disk. `$false` = errors only.                        |
 | `$WatchdogSec`         | `75`    | Force-exit bound for the whole run. Increase if your TV is very slow to boot.  |
 | `$MaxRegisterAttempts` | `30`    | EWS retries during a cold boot, spaced 1 s apart.                              |
 | `$MaxSwitchPasses`     | `6`     | Read/switch/re-read passes if the TV keeps reverting off the target input.     |
 | `$InputSettleMs`       | `2000`  | Listen-only window proving the TV did not overwrite the input during boot.     |
 | `$TVOnlineTimeoutMs`   | `25000` | Bound for WOL to bring the port up.                                            |
 
+`$DEBUG_MODE` no longer lives in the script; it is read from the store.
+See the Logging section.
+
 Everything else is an outer failure bound. Nothing is used to pace the
 happy path.
+
+Constants near the top of the wrapper:
+
+| Constant              | Default | Meaning                                                            |
+|-----------------------|---------|--------------------------------------------------------------------|
+| `DEFAULT_STATE`       | `Personal` | Fallback if the filename is not one of the three known states. |
+| `DEFAULT_DEBUG_MODE`  | `False` | Fallback if the store cannot be read.                              |
+| `MAX_LOG_BYTES`       | `2097152` | Wrapper log rotation threshold, matches `lgtv.ps1`.              |
 
 ---
 
 ## Exit codes
+
+`lgtv.ps1` returns:
 
 | Code | Meaning                                                                  |
 |------|--------------------------------------------------------------------------|
 | `0`  | The state was established completely, or another instance held the mutex.|
 | `1`  | The state failed to establish. The reason is on the console, and in `lgtv.log`. |
 
-The watchdog force-exits the process if a run exceeds `$WatchdogSec`. The
-next invocation releases the abandoned mutex automatically.
+The wrapper propagates the child's exit code verbatim. It additionally
+returns:
+
+| Code | Meaning                                                    |
+|------|------------------------------------------------------------|
+| `2`  | Preflight failed — PowerShell or `lgtv.ps1` not found.     |
+| `3`  | Failed to launch the child process.                        |
+
+The watchdog inside `lgtv.ps1` force-exits the process if a run exceeds
+`$WatchdogSec`. The next invocation releases the abandoned mutex
+automatically.
 
 ---
 
 ## Troubleshooting
+
+**Wrapper double-click does nothing visible**
+That's the point — the wrapper launches PowerShell with no console window.
+To see what happened, run `lgtv.ps1` directly instead, or check
+`wrapper.log` with `DEBUG_MODE = true`.
 
 **"TV did not become reachable on port 3001"**
 The TV did not wake. Check that wake-on-LAN is enabled, that the MAC in
@@ -246,8 +346,8 @@ path.
 
 **"TV never pushed a ready power state"**
 The TV's `getPowerState` subscription did not return an `Active` state
-within 20 s. Rare on healthy firmware. If it happens consistently, run
-with `$DEBUG_MODE = $true` and inspect the pushed states in `lgtv.log`.
+within 20 s. Rare on healthy firmware. If it happens consistently, set
+`DEBUG_MODE = true` and inspect the pushed states in `lgtv.log`.
 
 **`Personal` sets HDMI but Windows remains on internal only**
 The `SetDisplayConfig` call succeeded but Windows did not reproject within
@@ -265,16 +365,35 @@ overwriting it. Validate with:
 Get-Content lgtv_store.json | ConvertFrom-Json
 ```
 
+**Wrapper logs `[Default]` instead of `[Personal]` or `[Work]`**
+The filename of the `.vbs` you launched is not one of the three recognised
+names. Rename it — the wrapper reads the state from its own filename, so
+`LGTV Personal.vbs` will fall through to `DEFAULT_STATE` while
+`Personal.vbs` will not.
+
 ---
 
 ## Scheduling
 
-The script is designed to be triggered from a scheduled task (SYSTEM or an
-interactive user), a hotkey, or a manual run. It serialises itself via a
-global named mutex, so two triggers firing at once are safe — the second
-waits up to 15 s for the first to finish, then runs.
+Both entry points are suitable for a scheduled task (SYSTEM or an
+interactive user), a hotkey, or a manual run.
 
-For scheduled tasks, run with **highest privileges** so the ACL repairs on
+For a scheduled task, invoke the wrapper directly:
+
+```
+Program:   wscript.exe
+Arguments: "C:\...\LGTV\wrapper\Personal.vbs"
+```
+
+The wrapper's exit code propagates through `wscript.exe`, so Task
+Scheduler will see the real outcome of the state transition — it is not
+reported as success merely because the wrapper launched successfully.
+
+`lgtv.ps1` serialises itself via a global named mutex, so two triggers
+firing at once are safe — the second waits up to 15 s for the first to
+finish, then runs.
+
+Run with **highest privileges** so the ACL repairs on
 `C:\ProgramData\LGTVControl\` succeed. The store's ACL is deliberately
 permissive (`BUILTIN\Users: Modify`) so that a run under one identity does
 not lock out a run under another.
